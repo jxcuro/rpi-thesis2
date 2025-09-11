@@ -4,6 +4,9 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.24 - MODIFIED: Now uses the absolute value of the magnetism reading as input
+#                  -           for the magnetism AI model. The signed value is still
+#                  -           displayed in the results for user context.
 # Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
 #                  -           TFLite models (Visual, Magnetism, Resistivity).
 #                  - MODIFIED: Implemented a weighted-average system to combine model outputs.
@@ -137,9 +140,9 @@ LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 
 # --- Hierarchical Weights (Must sum to 1.0) ---
 MODEL_WEIGHTS = {
-    'visual': 0.3,
-    'magnetism': 0.35,
-    'resistivity': 0.35
+    'visual': 0.0,
+    'magnetism': 1.0,
+    'resistivity': 0.0
 }
 
 # --- Hardcoded Scaler Parameters ---
@@ -835,8 +838,18 @@ def capture_and_classify():
 
     # --- Preprocess Data for Each Model ---
     print("\n--- Preprocessing all inputs ---")
+
+    # ### MODIFIED SECTION START ###
+    # Use the absolute value of magnetism for the AI input, but keep the
+    # original signed value for display purposes.
+    magnetism_for_ai = None
+    if current_mag_mT is not None:
+        magnetism_for_ai = abs(current_mag_mT)
+        print(f"Original magnetism: {current_mag_mT:+.4f}mT, Using absolute value for AI: {magnetism_for_ai:.4f}mT")
+    # ### MODIFIED SECTION END ###
+
     visual_input = preprocess_visual_input(img_captured_pil, input_details_visual)
-    magnetism_input = preprocess_numerical_input(current_mag_mT, 'magnetism', input_details_magnetism)
+    magnetism_input = preprocess_numerical_input(magnetism_for_ai, 'magnetism', input_details_magnetism)
     resistivity_input = preprocess_numerical_input(current_rp_raw, 'resistivity', input_details_resistivity)
     
     # --- Run Inference on Each Model ---
@@ -856,7 +869,6 @@ def capture_and_classify():
     print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
 
     # --- Handle Saving and Sorting ---
-    # ### CORRECTED SECTION ###
     mag_display_text = ""
     if current_mag_mT is not None:
         if abs(current_mag_mT) < 0.1:
@@ -1055,7 +1067,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.23 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.24 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
