@@ -4,9 +4,9 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
-# Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
-#                  -           TFLite models (Visual, Magnetism, Resistivity).
-#                  - MODIFIED: Implemented a weighted-average system to combine model outputs.
+# Version: 3.0.24 - MODIFIED: Updated scaler parameters for magnetism and resistivity models.
+#                  - MODIFIED: Adjusted hierarchical model weights based on sensor reliability feedback.
+#                  - MODIFIED: Adapted data preprocessing to support multi-feature numerical models (for new resistivity model).
 #                  - REMOVED:  Removed joblib dependency; scaler parameters are now hardcoded.
 # FIXED:       Potential mismatch between sensor data processing and scaler expectation.
 # DEBUG:       Enhanced prints in capture_and_classify, preprocess_input, run_inference, postprocess_output.
@@ -136,6 +136,7 @@ MODEL_RESISTIVITY_PATH = os.path.join(BASE_PATH, MODEL_RESISTIVITY_FILENAME)
 LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 
 # --- Hierarchical Weights (Must sum to 1.0) ---
+# MODIFIED: Adjusted weights based on sensor reliability. Resistivity is highest, magnetism is lowest.
 MODEL_WEIGHTS = {
     'visual': 0.0,
     'magnetism': 0.0,
@@ -148,12 +149,12 @@ MODEL_WEIGHTS = {
 #       per feature the model expects (e.g., [value1] for 1 feature).
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [-4.762684124386253e-05],  # Example: Mean of magnetism training data
-        'scale': [0.0009136177067612571]  # Example: Std Dev of magnetism training data
+        'mean': [0.00048415711947626843],  # Updated Mean of magnetism training data
+        'scale': [0.0007762457818081904]   # Updated Std Dev of magnetism training data
     },
     'resistivity': {
-        'mean': [61000.82880524], # Example: Mean of LDC RP training data
-        'scale': [1362.77165264]   # Example: Std Dev of LDC RP training data
+        'mean': [61000.82880523732],   # Updated Mean of LDC RP training data
+        'scale': [1362.7716526399417]    # Updated Std Dev of LDC RP training data
     }
 }
 # =========================================
@@ -528,7 +529,7 @@ def preprocess_visual_input(image_pil, input_details):
         return None
 
 def preprocess_numerical_input(value, model_type, input_details):
-    """Prepares and scales a single numerical value for a sensor model."""
+    """Prepares and scales a single numerical value or a list of values for a sensor model."""
     if value is None or not input_details: return None
     try:
         # Get scaler params for the specific model
@@ -537,16 +538,28 @@ def preprocess_numerical_input(value, model_type, input_details):
             print(f"ERROR: No scaler parameters defined for model type '{model_type}'.")
             return None
         
-        raw_value = np.array([[float(value)]], dtype=np.float32)
+        # MODIFIED: Handle single value or list of values for multi-feature models
+        if isinstance(value, (list, tuple)):
+            raw_value = np.array([value], dtype=np.float32) # Shape -> [[feat1, feat2, ...]]
+        else:
+            raw_value = np.array([[float(value)]], dtype=np.float32) # Shape -> [[feat1]]
         
         # Manual scaling: (value - mean) / scale
         mean = np.array(params['mean'], dtype=np.float32)
         scale = np.array(params['scale'], dtype=np.float32)
+
+        # Sanity check for feature mismatch
+        if raw_value.shape[1] != len(params['mean']):
+            print(f"ERROR: Preprocessing feature count mismatch for '{model_type}'.")
+            print(f"       Input has {raw_value.shape[1]} features, but scaler expects {len(params['mean'])}.")
+            return None
+
         scaled_value = (raw_value - mean) / scale
         
         return scaled_value.astype(input_details[0]['dtype'])
     except Exception as e:
         print(f"ERROR: Numerical preprocessing for {model_type} failed: {e}")
+        traceback.print_exc()
         return None
 
 # ### NEW ### - Function to run inference on a single model
@@ -825,19 +838,25 @@ def capture_and_classify():
     else:
         print("ERROR: Hall sensor read failed during capture.")
 
-    # LDC Reading
+    # LDC Reading (MODIFIED for two features: raw and delta)
     current_rp_raw = None
+    current_rp_delta = None
+    resistivity_features = None
     avg_rp_val = get_averaged_rp_data(num_samples=NUM_SAMPLES_CALIBRATION)
     if avg_rp_val is not None:
         current_rp_raw = avg_rp_val
+        current_rp_delta = current_rp_raw - IDLE_RP_VALUE
+        resistivity_features = [current_rp_raw, current_rp_delta]
     else:
         print("ERROR: LDC read failed during capture.")
+
 
     # --- Preprocess Data for Each Model ---
     print("\n--- Preprocessing all inputs ---")
     visual_input = preprocess_visual_input(img_captured_pil, input_details_visual)
     magnetism_input = preprocess_numerical_input(current_mag_mT, 'magnetism', input_details_magnetism)
-    resistivity_input = preprocess_numerical_input(current_rp_raw, 'resistivity', input_details_resistivity)
+    # MODIFIED: Pass the list of features to the preprocessor
+    resistivity_input = preprocess_numerical_input(resistivity_features, 'resistivity', input_details_resistivity)
     
     # --- Run Inference on Each Model ---
     print("\n--- Running inference on all models ---")
@@ -856,7 +875,6 @@ def capture_and_classify():
     print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
 
     # --- Handle Saving and Sorting ---
-    # ### CORRECTED SECTION ###
     mag_display_text = ""
     if current_mag_mT is not None:
         if abs(current_mag_mT) < 0.1:
@@ -867,6 +885,9 @@ def capture_and_classify():
         mag_display_text = "ReadErr"
         
     ldc_display_text = f"{int(round(current_rp_raw))}" if current_rp_raw is not None else "ReadErr"
+    if current_rp_delta is not None:
+        ldc_display_text += f" (Δ{current_rp_delta:+,})"
+
 
     if save_output_var and save_output_var.get() == 1:
         save_result_screenshot(img_captured_pil, predicted_label, confidence, mag_display_text, ldc_display_text)
@@ -1055,7 +1076,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.23 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.24 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
