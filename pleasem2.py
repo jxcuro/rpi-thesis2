@@ -145,8 +145,8 @@ LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 # --- Hierarchical Weights (Must sum to 1.0) ---
 MODEL_WEIGHTS = {
     'visual': 0.0,
-    'magnetism': 0.5,
-    'resistivity': 0.5
+    'magnetism': 1.0,
+    'resistivity': 0.0
 }
 
 # --- Hardcoded Scaler Parameters ---
