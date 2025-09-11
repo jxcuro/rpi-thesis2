@@ -1067,7 +1067,7 @@ def manage_automation_flow():
         # STATE IS LOW: Increment counter and check for calibration
         elif current_state == GPIO.LOW:
             g_low_pulse_counter += 1
-            if g_low_pulse_counter >= 5:
+            if g_low_pulse_counter >= 7:
                 # print("AUTOMATION: 5 consecutive LOW states detected. Auto-calibrating...") # Uncomment for debug
                 calibrate_sensors(is_manual_call=False)
                 g_low_pulse_counter = 0 # Reset after calibrating
