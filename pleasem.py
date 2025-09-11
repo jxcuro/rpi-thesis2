@@ -1,7 +1,32 @@
-# CODE 3.0.22 - Multi-AI Metal Classifier GUI with Gated Automation
+# CODE 3.0.21 - AI Metal Classifier GUI with Gated Automation
 # Description: Displays live sensor data and camera feed.
-#              - Uses THREE separate AI models: visual, magnetism, and resistivity
-#              - Each AI has configurable weights for ensemble prediction
+#              - On startup, waits for a LOW->HIGH signal on GPIO 23 to classify.
+#              - While GPIO 23 is LOW, it continuously auto-calibrates.
+#              - After classifying, it enters a PAUSED state, ignoring new triggers.
+#              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.28 - FIXED: Magnetism reading instability by implementing "smart"
+#                  -           auto-calibration. The system now checks if a magnetic
+#                  -           field is present before recalibrating the idle voltage,
+#                  -           preventing the baseline from being incorrectly reset.
+# Version: 3.0.27 - MODIFIED: LDC display is now "rawer", similar to magnetism-test.py.
+#                  -           Removed the temporal smoothing buffer (RP_DISPLAY_BUFFER) to make
+#                  -           the live reading more responsive. A small amount of smoothing is
+#                  -           retained by taking the median of a few fast samples per update.
+# Version: 3.0.26 - IMPROVED: Averaging logic for sensor readings now uses the median
+#                  -           instead of the mean. This provides more robust noise
+#                  -           rejection against outlier data spikes.
+# Version: 3.0.25 - MODIFIED: Magnetism display logic updated to match 'magnetism-test.py'.
+#                  -           The display now switches from milliTesla (mT) to microTesla (µT)
+#                  -           when the absolute magnetism value is less than 1.0 mT.
+# Version: 3.0.24 - MODIFIED: Now uses the absolute value of the magnetism reading as input
+#                  -           for the magnetism AI model. The signed value is still
+#                  -           displayed in the results for user context.
+# Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
+#                  -           TFLite models (Visual, Magnetism, Resistivity).
+#                  - MODIFIED: Implemented a weighted-average system to combine model outputs.
+#                  - REMOVED:  Removed joblib dependency; scaler parameters are now hardcoded.
+# FIXED:       Potential mismatch between sensor data processing and scaler expectation.
+# DEBUG:       Enhanced prints in capture_and_classify, preprocess_input, run_inference, postprocess_output.
 
 import tkinter as tk
 from tkinter import ttk
@@ -30,7 +55,6 @@ except ImportError:
         print("ERROR: TensorFlow Lite Runtime is not installed.")
         print("Please install it (e.g., 'pip install tflite-runtime' or follow official Pi instructions)")
         exit()
-
 
 # --- I2C/ADS1115 Imports (for Hall Sensor/Magnetism) ---
 I2C_ENABLED = False # Default to False, set True if libraries import successfully
@@ -105,19 +129,51 @@ except NameError:
     BASE_PATH = os.getcwd()
     print(f"Warning: __file__ not defined, using current working directory as base path: {BASE_PATH}")
 
-MODEL_FILENAME = "material_classifier_model.tflite"
+# =========================================
+# ### NEW ### - Hierarchical Model Setup
+# =========================================
+# --- Model Filenames ---
+MODEL_VISUAL_FILENAME = "visual_model.tflite"
+MODEL_MAGNETISM_FILENAME = "magnetism_model.tflite"
+MODEL_RESISTIVITY_FILENAME = "resistivity_model.tflite"
 LABELS_FILENAME = "material_labels.txt"
-SCALER_FILENAME = "numerical_scaler.joblib"
-MODEL_PATH = os.path.join(BASE_PATH, MODEL_FILENAME)
+
+# --- Model Paths ---
+MODEL_VISUAL_PATH = os.path.join(BASE_PATH, MODEL_VISUAL_FILENAME)
+MODEL_MAGNETISM_PATH = os.path.join(BASE_PATH, MODEL_MAGNETISM_FILENAME)
+MODEL_RESISTIVITY_PATH = os.path.join(BASE_PATH, MODEL_RESISTIVITY_FILENAME)
 LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
-SCALER_PATH = os.path.join(BASE_PATH, SCALER_FILENAME)
+
+# --- Hierarchical Weights (Must sum to 1.0) ---
+MODEL_WEIGHTS = {
+    'visual': 0.0,
+    'magnetism': 1.0,
+    'resistivity': 0.0
+}
+
+# --- Hardcoded Scaler Parameters ---
+# NOTE: Replace these placeholder values with the actual mean and scale
+#       values from your trained scalers. Each list should have one value
+#       per feature the model expects (e.g., [value1] for 1 feature).
+SCALER_PARAMS = {
+    'magnetism': {
+        'mean': [0.00048415711947626843],  # Example: Mean of magnetism training data
+        'scale': [0.0007762457818081904]  # Example: Std Dev of magnetism training data
+    },
+    'resistivity': {
+        'mean': [61000.82880523732], # Example: Mean of LDC RP training data
+        'scale': [1362.7716526399417]   # Example: Std Dev of LDC RP training data
+    }
+}
+# =========================================
+
 TESTING_FOLDER_NAME = "testing" # Folder to save screenshots
 
 AI_IMG_WIDTH = 224
 AI_IMG_HEIGHT = 224
 
 HALL_ADC_CHANNEL = ADS.P0 if I2C_ENABLED else None
-SENSITIVITY_V_PER_TESLA = 0.0002
+SENSITIVITY_V_PER_TESLA = 0.0004
 SENSITIVITY_V_PER_MILLITESLA = SENSITIVITY_V_PER_TESLA * 1000
 IDLE_VOLTAGE = 0.0
 
@@ -134,41 +190,6 @@ D_CONF_REG, INTB_MODE_REG, RP_DATA_MSB_REG, RP_DATA_LSB_REG, CHIP_ID_REG = \
 ACTIVE_CONVERSION_MODE, SLEEP_MODE = 0x00, 0x01
 IDLE_RP_VALUE = 0
 
-# =========================
-# === AI Model Configuration ===
-# =========================
-
-# Model file paths - update these to point to your three model files
-VISUAL_MODEL_PATH = "visual_model.tftlite"
-MAGNETISM_MODEL_PATH = "magnetism_model.tftlite" 
-RESISTIVITY_MODEL_PATH = "resistivity_model.tftlite"
-
-# AI Model Weights - EASILY EDITABLE
-AI_WEIGHTS = {
-    'visual': 0.0,      # Weight for visual AI model
-    'magnetism': 1.0,   # Weight for magnetism AI model  
-    'resistivity': 0.0  # Weight for resistivity AI model
-}
-
-# Ensure weights sum to 1.0
-total_weight = sum(AI_WEIGHTS.values())
-if abs(total_weight - 1.0) > 1e-6:
-    print(f"WARNING: AI weights sum to {total_weight}, normalizing to 1.0")
-    for key in AI_WEIGHTS:
-        AI_WEIGHTS[key] /= total_weight
-
-# Magnetism Model Scaler (embedded)
-MAGNETISM_SCALER = {
-    'mean': 0.00048415711947626843,
-    'scale': 0.0007762457818081904
-}
-
-# Resistivity Model Scaler (embedded) 
-RESISTIVITY_SCALER = {
-    'mean': 61000.82880523732,
-    'scale': 1362.7716526399417
-}
-
 # ============================
 # === Global Objects/State ===
 # ============================
@@ -179,11 +200,17 @@ hall_sensor = None
 spi = None
 ldc_initialized = False
 
-interpreter = None
-input_details = None
-output_details = None
+# ### MODIFIED ### - Globals for the three AI models
+interpreter_visual = None
+interpreter_magnetism = None
+interpreter_resistivity = None
+input_details_visual = None
+output_details_visual = None
+input_details_magnetism = None
+output_details_magnetism = None
+input_details_resistivity = None
+output_details_resistivity = None
 loaded_labels = []
-numerical_scaler = None
 
 RP_DISPLAY_BUFFER = deque(maxlen=LDC_DISPLAY_BUFFER_SIZE)
 g_last_live_magnetism_mT = 0.0
@@ -194,7 +221,7 @@ main_frame = None
 live_view_frame = None
 results_view_frame = None
 label_font, readout_font, button_font, title_font, result_title_font, result_value_font, pred_font = (None,) * 7
-lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4 
+lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4
 rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label, rv_classify_another_button = (None,) * 6
 placeholder_img_tk = None
 save_output_var = None
@@ -202,7 +229,7 @@ save_output_var = None
 # --- NEW: State for Gated GPIO Automation ---
 g_accepting_triggers = True     # Controls if the system will respond to a GPIO signal
 g_previous_control_state = None # Tracks GPIO 23 state to detect rising edges
-g_last_calibration_time = 0     # Timestamp of the last auto-calibration
+g_low_pulse_counter = 0         # Counts consecutive LOW reads for calibration trigger
 
 # =========================
 # === Hardware Setup ===
@@ -332,102 +359,64 @@ def initialize_hardware():
 # =========================
 # === AI Model Setup ======
 # =========================
-# Global AI variables for three models
-visual_interpreter = None
-magnetism_interpreter = None  
-resistivity_interpreter = None
-visual_input_details = None
-magnetism_input_details = None
-resistivity_input_details = None
-visual_output_details = None
-magnetism_output_details = None
-resistivity_output_details = None
-
 def initialize_ai():
-    global visual_interpreter, magnetism_interpreter, resistivity_interpreter
-    global visual_input_details, magnetism_input_details, resistivity_input_details
-    global visual_output_details, magnetism_output_details, resistivity_output_details
     global loaded_labels
+    global interpreter_visual, input_details_visual, output_details_visual
+    global interpreter_magnetism, input_details_magnetism, output_details_magnetism
+    global interpreter_resistivity, input_details_resistivity, output_details_resistivity
+
+    print("\n--- Initializing AI Components (Hierarchical) ---")
     
-    print("=== Initializing Multi-AI System ===")
-    
-    # Initialize visual model
-    visual_ready = False
-    if os.path.exists(VISUAL_MODEL_PATH):
+    # --- Load Labels (common for all models) ---
+    print(f"Loading labels from: {LABELS_PATH}")
+    try:
+        with open(LABELS_PATH, 'r') as f:
+            loaded_labels = [line.strip() for line in f.readlines()]
+        if not loaded_labels:
+            raise ValueError("Labels file is empty.")
+        print(f"Loaded {len(loaded_labels)} labels: {loaded_labels}")
+    except Exception as e:
+        print(f"FATAL ERROR: Reading labels file '{LABELS_FILENAME}' failed: {e}")
+        return False
+
+    # --- Helper function to load a single model ---
+    def load_model(model_name, model_path):
+        print(f"\n--- Loading {model_name} Model ---")
         try:
-            print(f"Loading Visual AI model from: {VISUAL_MODEL_PATH}")
-            visual_interpreter = Interpreter(model_path=VISUAL_MODEL_PATH)
-            visual_interpreter.allocate_tensors()
-            visual_input_details = visual_interpreter.get_input_details()
-            visual_output_details = visual_interpreter.get_output_details()
-            visual_ready = True
-            print("Visual AI model loaded successfully.")
+            interpreter = Interpreter(model_path=model_path)
+            interpreter.allocate_tensors()
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            # Basic validation
+            if not input_details or not output_details:
+                print(f"ERROR: Failed to get input/output details for {model_name}.")
+                return None, None, None
+            if output_details[0]['shape'][-1] != len(loaded_labels):
+                 print(f"ERROR: {model_name} output size ({output_details[0]['shape'][-1]}) does not match label count ({len(loaded_labels)}).")
+                 return None, None, None
+            print(f"{model_name} model loaded successfully.")
+            return interpreter, input_details, output_details
         except Exception as e:
-            print(f"ERROR: Loading Visual AI model: {e}")
+            print(f"ERROR: Failed to load TFLite model '{os.path.basename(model_path)}': {e}")
             traceback.print_exc()
-    else:
-        print(f"ERROR: Visual model file not found: {VISUAL_MODEL_PATH}")
-    
-    # Initialize magnetism model
-    magnetism_ready = False
-    if os.path.exists(MAGNETISM_MODEL_PATH):
-        try:
-            print(f"Loading Magnetism AI model from: {MAGNETISM_MODEL_PATH}")
-            magnetism_interpreter = Interpreter(model_path=MAGNETISM_MODEL_PATH)
-            magnetism_interpreter.allocate_tensors()
-            magnetism_input_details = magnetism_interpreter.get_input_details()
-            magnetism_output_details = magnetism_interpreter.get_output_details()
-            magnetism_ready = True
-            print("Magnetism AI model loaded successfully.")
-        except Exception as e:
-            print(f"ERROR: Loading Magnetism AI model: {e}")
-            traceback.print_exc()
-    else:
-        print(f"ERROR: Magnetism model file not found: {MAGNETISM_MODEL_PATH}")
-    
-    # Initialize resistivity model
-    resistivity_ready = False
-    if os.path.exists(RESISTIVITY_MODEL_PATH):
-        try:
-            print(f"Loading Resistivity AI model from: {RESISTIVITY_MODEL_PATH}")
-            resistivity_interpreter = Interpreter(model_path=RESISTIVITY_MODEL_PATH)
-            resistivity_interpreter.allocate_tensors()
-            resistivity_input_details = resistivity_interpreter.get_input_details()
-            resistivity_output_details = resistivity_interpreter.get_output_details()
-            resistivity_ready = True
-            print("Resistivity AI model loaded successfully.")
-        except Exception as e:
-            print(f"ERROR: Loading Resistivity AI model: {e}")
-            traceback.print_exc()
-    else:
-        print(f"ERROR: Resistivity model file not found: {RESISTIVITY_MODEL_PATH}")
-    
-    # Check if at least one model is ready
-    ai_ready = visual_ready or magnetism_ready or resistivity_ready
-    
-    if not ai_ready:
-        print("--- Multi-AI Initialization Failed - No models loaded ---")
+            return None, None, None
+
+    # --- Load all three models ---
+    interpreter_visual, input_details_visual, output_details_visual = load_model("Visual", MODEL_VISUAL_PATH)
+    interpreter_magnetism, input_details_magnetism, output_details_magnetism = load_model("Magnetism", MODEL_MAGNETISM_PATH)
+    interpreter_resistivity, input_details_resistivity, output_details_resistivity = load_model("Resistivity", MODEL_RESISTIVITY_PATH)
+
+    # --- Final Check ---
+    all_models_loaded = all([interpreter_visual, interpreter_magnetism, interpreter_resistivity])
+    if not all_models_loaded:
+        print("\n--- AI Initialization Failed: One or more models could not be loaded. ---")
         return False
     else:
-        print(f"--- Multi-AI Initialization Complete ---")
-        print(f"Visual AI: {'Ready' if visual_ready else 'Failed'}")
-        print(f"Magnetism AI: {'Ready' if magnetism_ready else 'Failed'}")
-        print(f"Resistivity AI: {'Ready' if resistivity_ready else 'Failed'}")
+        # Check weight sum
+        if not math.isclose(sum(MODEL_WEIGHTS.values()), 1.0):
+             print(f"WARNING: Model weights sum to {sum(MODEL_WEIGHTS.values())}, not 1.0. This may cause unexpected results.")
+        print("\n--- All AI Models Initialized Successfully ---")
         return True
-
-def scale_magnetism_value(raw_value):
-    """Scale magnetism value using embedded scaler parameters"""
-    if raw_value is None:
-        return 0.0
-    # Convert to absolute value as requested
-    abs_value = abs(float(raw_value))
-    return (abs_value - MAGNETISM_SCALER['mean']) / MAGNETISM_SCALER['scale']
-
-def scale_resistivity_value(raw_value):
-    """Scale resistivity value using embedded scaler parameters"""
-    if raw_value is None:
-        return 0.0
-    return (float(raw_value) - RESISTIVITY_SCALER['mean']) / RESISTIVITY_SCALER['scale']
 
 # =========================
 # === LDC1101 Functions ===
@@ -516,7 +505,8 @@ def get_averaged_hall_voltage(num_samples=NUM_SAMPLES_PER_UPDATE):
     for _ in range(num_samples):
         try: readings.append(hall_sensor.voltage)
         except Exception as e: print(f"Warning: Error reading Hall sensor: {e}. Aborting average."); return None
-    if readings: return statistics.mean(readings)
+    # ### IMPROVED: Use median to be more robust against outlier noise spikes ###
+    if readings: return statistics.median(readings)
     else: return None
 
 def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
@@ -525,323 +515,378 @@ def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
     for _ in range(num_samples):
         rp_value = get_ldc_rpdata()
         if rp_value is not None: readings.append(rp_value)
-    if readings: return statistics.mean(readings)
+    # ### IMPROVED: Use median to be more robust against outlier noise spikes ###
+    if readings: return statistics.median(readings)
     else: return None
 
 # ==========================
 # === AI Processing ========
 # ==========================
-def preprocess_visual_input(image_pil):
-    """Preprocess image for visual AI model"""
-    global visual_input_details
-    print("--- Preprocessing Visual Input ---")
-    
-    if visual_interpreter is None or visual_input_details is None:
-        print("ERROR: Visual AI Model not initialized.")
-        return None
-        
+def preprocess_visual_input(image_pil, input_details):
+    """Prepares image data for the visual model."""
+    if not input_details: return None
     try:
         img_resized = image_pil.resize((AI_IMG_WIDTH, AI_IMG_HEIGHT), Image.Resampling.LANCZOS)
         image_np = np.array(img_resized.convert('RGB'), dtype=np.float32)
-        image_np /= 255.0
+        image_np /= 255.0  # Normalize to [0, 1]
         image_input = np.expand_dims(image_np, axis=0)
-        
-        # Convert to expected dtype
-        input_dtype = visual_input_details[0]['dtype']
-        if input_dtype == np.uint8:
-            image_input = (image_input * 255.0).astype(np.uint8)
-        else:
-            image_input = image_input.astype(input_dtype)
-            
-        print(f"Visual input preprocessed. Shape: {image_input.shape}")
-        return image_input
+        # Ensure data type matches model's expectation
+        return image_input.astype(input_details[0]['dtype'])
     except Exception as e:
         print(f"ERROR: Visual preprocessing failed: {e}")
         return None
 
-def preprocess_magnetism_input(mag_mT):
-    """Preprocess magnetism data for magnetism AI model"""
-    global magnetism_input_details
-    print("--- Preprocessing Magnetism Input ---")
-    
-    if magnetism_interpreter is None or magnetism_input_details is None:
-        print("ERROR: Magnetism AI Model not initialized.")
-        return None
-        
+def preprocess_numerical_input(value, model_type, input_details):
+    """Prepares and scales a single numerical value for a sensor model."""
+    if value is None or not input_details: return None
     try:
-        # Scale the magnetism value (with absolute value conversion)
-        scaled_mag = scale_magnetism_value(mag_mT)
-        magnetism_input = np.array([[scaled_mag]], dtype=magnetism_input_details[0]['dtype'])
-        print(f"Magnetism input preprocessed. Raw: {mag_mT}, Scaled: {scaled_mag}")
-        return magnetism_input
+        # Get scaler params for the specific model
+        params = SCALER_PARAMS.get(model_type)
+        if not params:
+            print(f"ERROR: No scaler parameters defined for model type '{model_type}'.")
+            return None
+        
+        raw_value = np.array([[float(value)]], dtype=np.float32)
+        
+        # Manual scaling: (value - mean) / scale
+        mean = np.array(params['mean'], dtype=np.float32)
+        scale = np.array(params['scale'], dtype=np.float32)
+        scaled_value = (raw_value - mean) / scale
+        
+        return scaled_value.astype(input_details[0]['dtype'])
     except Exception as e:
-        print(f"ERROR: Magnetism preprocessing failed: {e}")
+        print(f"ERROR: Numerical preprocessing for {model_type} failed: {e}")
         return None
 
-def preprocess_resistivity_input(ldc_rp_raw):
-    """Preprocess resistivity data for resistivity AI model"""
-    global resistivity_input_details
-    print("--- Preprocessing Resistivity Input ---")
-    
-    if resistivity_interpreter is None or resistivity_input_details is None:
-        print("ERROR: Resistivity AI Model not initialized.")
+def run_single_inference(interpreter, input_details, processed_input):
+    """Runs inference on a single TFLite interpreter."""
+    if interpreter is None or processed_input is None:
         return None
-        
     try:
-        # Scale the resistivity value
-        scaled_rp = scale_resistivity_value(ldc_rp_raw)
-        resistivity_input = np.array([[scaled_rp]], dtype=resistivity_input_details[0]['dtype'])
-        print(f"Resistivity input preprocessed. Raw: {ldc_rp_raw}, Scaled: {scaled_rp}")
-        return resistivity_input
-    except Exception as e:
-        print(f"ERROR: Resistivity preprocessing failed: {e}")
-        return None
-
-def run_visual_inference(visual_input):
-    """Run inference on visual AI model"""
-    global visual_interpreter, visual_output_details
-    print("--- Running Visual AI Inference ---")
-    
-    if visual_interpreter is None or visual_input is None:
-        print("ERROR: Visual interpreter/input not ready.")
-        return None
-        
-    try:
-        visual_interpreter.set_tensor(visual_input_details[0]['index'], visual_input)
-        visual_interpreter.invoke()
-        output_data = visual_interpreter.get_tensor(visual_output_details[0]['index'])
-        print(f"Visual inference complete. Output shape: {output_data.shape}")
+        interpreter.set_tensor(input_details[0]['index'], processed_input)
+        interpreter.invoke()
+        output_details = interpreter.get_output_details()
+        output_data = interpreter.get_tensor(output_details[0]['index'])
+        # Return the raw probability array (e.g., [[0.1, 0.8, 0.1]])
         return output_data
     except Exception as e:
-        print(f"ERROR: Visual inference failed: {e}")
+        print(f"ERROR: Inference failed: {e}")
+        traceback.print_exc()
         return None
 
-def run_magnetism_inference(magnetism_input):
-    """Run inference on magnetism AI model"""
-    global magnetism_interpreter, magnetism_output_details
-    print("--- Running Magnetism AI Inference ---")
-    
-    if magnetism_interpreter is None or magnetism_input is None:
-        print("ERROR: Magnetism interpreter/input not ready.")
-        return None
-        
-    try:
-        magnetism_interpreter.set_tensor(magnetism_input_details[0]['index'], magnetism_input)
-        magnetism_interpreter.invoke()
-        output_data = magnetism_interpreter.get_tensor(magnetism_output_details[0]['index'])
-        print(f"Magnetism inference complete. Output shape: {output_data.shape}")
-        return output_data
-    except Exception as e:
-        print(f"ERROR: Magnetism inference failed: {e}")
-        return None
-
-def run_resistivity_inference(resistivity_input):
-    """Run inference on resistivity AI model"""
-    global resistivity_interpreter, resistivity_output_details
-    print("--- Running Resistivity AI Inference ---")
-    
-    if resistivity_interpreter is None or resistivity_input is None:
-        print("ERROR: Resistivity interpreter/input not ready.")
-        return None
-        
-    try:
-        resistivity_interpreter.set_tensor(resistivity_input_details[0]['index'], resistivity_input)
-        resistivity_interpreter.invoke()
-        output_data = resistivity_interpreter.get_tensor(resistivity_output_details[0]['index'])
-        print(f"Resistivity inference complete. Output shape: {output_data.shape}")
-        return output_data
-    except Exception as e:
-        print(f"ERROR: Resistivity inference failed: {e}")
-        return None
-
-def combine_predictions(visual_output, magnetism_output, resistivity_output):
-    """Combine predictions from all three AI models using weighted ensemble"""
-    global loaded_labels, AI_WEIGHTS
-    print("--- Combining Multi-AI Predictions ---")
-    
+def postprocess_hierarchical_output(outputs):
+    global loaded_labels, MODEL_WEIGHTS
+    print("\n--- Postprocessing AI Outputs (Hierarchical) ---")
     if not loaded_labels:
-        print("ERROR: No labels loaded for prediction combination.")
+        print("ERROR: No labels loaded for postprocessing.")
         return "Error", 0.0
-    
-    # Initialize combined probabilities
-    num_classes = len(loaded_labels)
-    combined_probs = np.zeros(num_classes)
-    total_weight_used = 0.0
-    
-    # Process visual predictions
-    if visual_output is not None and visual_interpreter is not None:
-        try:
-            visual_probs = visual_output[0] if len(visual_output.shape) == 2 else visual_output
-            if len(visual_probs) == num_classes:
-                combined_probs += visual_probs * AI_WEIGHTS['visual']
-                total_weight_used += AI_WEIGHTS['visual']
-                print(f"Visual AI contribution: weight={AI_WEIGHTS['visual']}")
-            else:
-                print(f"WARNING: Visual output size mismatch: {len(visual_probs)} vs {num_classes}")
-        except Exception as e:
-            print(f"ERROR processing visual predictions: {e}")
-    
-    # Process magnetism predictions  
-    if magnetism_output is not None and magnetism_interpreter is not None:
-        try:
-            magnetism_probs = magnetism_output[0] if len(magnetism_output.shape) == 2 else magnetism_output
-            if len(magnetism_probs) == num_classes:
-                combined_probs += magnetism_probs * AI_WEIGHTS['magnetism']
-                total_weight_used += AI_WEIGHTS['magnetism']
-                print(f"Magnetism AI contribution: weight={AI_WEIGHTS['magnetism']}")
-            else:
-                print(f"WARNING: Magnetism output size mismatch: {len(magnetism_probs)} vs {num_classes}")
-        except Exception as e:
-            print(f"ERROR processing magnetism predictions: {e}")
-    
-    # Process resistivity predictions
-    if resistivity_output is not None and resistivity_interpreter is not None:
-        try:
-            resistivity_probs = resistivity_output[0] if len(resistivity_output.shape) == 2 else resistivity_output
-            if len(resistivity_probs) == num_classes:
-                combined_probs += resistivity_probs * AI_WEIGHTS['resistivity']
-                total_weight_used += AI_WEIGHTS['resistivity']
-                print(f"Resistivity AI contribution: weight={AI_WEIGHTS['resistivity']}")
-            else:
-                print(f"WARNING: Resistivity output size mismatch: {len(resistivity_probs)} vs {num_classes}")
-        except Exception as e:
-            print(f"ERROR processing resistivity predictions: {e}")
-    
-    # Normalize by total weight used (in case some models failed)
-    if total_weight_used > 0:
-        combined_probs /= total_weight_used
-        print(f"Total weight used: {total_weight_used}")
-    else:
-        print("ERROR: No valid predictions from any AI model.")
-        return "No AI", 0.0
-    
-    # Get final prediction
-    predicted_index = np.argmax(combined_probs)
-    confidence = float(combined_probs[predicted_index])
-    predicted_label = loaded_labels[predicted_index]
-    
-    print(f"Final Ensemble Prediction: '{predicted_label}', Confidence: {confidence:.4f}")
-    print("--- Multi-AI Prediction Complete ---")
-    
-    return predicted_label, confidence
 
+    # Ensure we have the same number of outputs as weights
+    if len(outputs) != len(MODEL_WEIGHTS):
+        print(f"ERROR: Mismatch between number of model outputs ({len(outputs)}) and weights ({len(MODEL_WEIGHTS)}).")
+        return "Mismatch Err", 0.0
+
+    # Initialize a zero array for the final probabilities
+    num_classes = len(loaded_labels)
+    final_probabilities = np.zeros(num_classes, dtype=np.float32)
+    
+    # Apply weights and sum the probabilities
+    for model_type, raw_output in outputs.items():
+        weight = MODEL_WEIGHTS.get(model_type, 0)
+        if weight == 0:
+            print(f"Warning: No weight found for model '{model_type}', skipping its output.")
+            continue
+        
+        if raw_output is not None and raw_output.shape == (1, num_classes):
+            probabilities = raw_output[0] # Extract the 1D array from [[...]]
+            weighted_probs = probabilities * weight
+            final_probabilities += weighted_probs
+            print(f"  -> Applied weight {weight:.2f} to {model_type} output.")
+        else:
+            print(f"Warning: Skipping invalid or missing output from {model_type} model.")
+    
+    print(f"Final combined probabilities: {final_probabilities}")
+    
+    # Get the final prediction from the combined probabilities
+    try:
+        predicted_index = np.argmax(final_probabilities)
+        # The confidence is the value of the highest probability in the combined result
+        confidence = float(final_probabilities[predicted_index])
+        predicted_label = loaded_labels[predicted_index]
+        
+        print(f"Final Prediction: '{predicted_label}', Confidence: {confidence:.4f}")
+        print("--- Postprocessing Complete ---")
+        return predicted_label, confidence
+    except Exception as e:
+        print(f"ERROR: Postprocessing failed: {e}")
+        return "Post Err", 0.0
+
+# ==================================
+# === Sorting Signal Functions ===
+# ==================================
+def send_sorting_signal(material_label):
+    if not SORTING_GPIO_ENABLED: print("Sorting Signal: GPIO for sorting not enabled. Skipping send."); return
+    if not RPi_GPIO_AVAILABLE: print("Sorting Signal: RPi.GPIO library not available. Cannot send signal."); return
+
+    print(f"\n--- Sending Sorting Signal for: {material_label} ---")
+    mid_val, lsb_val = GPIO.LOW, GPIO.LOW
+    signal_desc = "Others (00)"
+    if material_label == "Aluminum": mid_val, lsb_val, signal_desc = GPIO.LOW, GPIO.HIGH, "Aluminum (01)"
+    elif material_label == "Copper": mid_val, lsb_val, signal_desc = GPIO.HIGH, GPIO.LOW, "Copper (10)"
+    elif material_label == "Steel": mid_val, lsb_val, signal_desc = GPIO.HIGH, GPIO.HIGH, "Steel (11)"
+
+    try:
+        GPIO.output(SORTING_DATA_READY_PIN, GPIO.LOW)
+        time.sleep(0.01)
+        GPIO.output(SORTING_DATA_PIN_MID, mid_val)
+        GPIO.output(SORTING_DATA_PIN_LSB, lsb_val)
+        print(f"Set GPIO Pins: MID={mid_val}, LSB={lsb_val} for {signal_desc}")
+        time.sleep(0.01)
+        GPIO.output(SORTING_DATA_READY_PIN, GPIO.HIGH)
+        print(f"Pulsed {SORTING_DATA_READY_PIN} HIGH (Data Ready)")
+        time.sleep(0.05)
+        GPIO.output(SORTING_DATA_READY_PIN, GPIO.LOW)
+        print(f"Set {SORTING_DATA_READY_PIN} LOW (Data Transmitted)")
+        time.sleep(0.01)
+        GPIO.output(SORTING_DATA_PIN_MID, GPIO.LOW)
+        GPIO.output(SORTING_DATA_PIN_LSB, GPIO.LOW)
+        print(f"Data pins ({SORTING_DATA_PIN_MID}, {SORTING_DATA_PIN_LSB}) reset to LOW after signal.")
+        print(f"--- Sorting signal {signal_desc} sent ---")
+    except Exception as e:
+        print(f"ERROR: Failed to send sorting signal via GPIO: {e}")
+        try:
+            if RPi_GPIO_AVAILABLE:
+                GPIO.output(SORTING_DATA_READY_PIN, GPIO.LOW)
+                GPIO.output(SORTING_DATA_PIN_MID, GPIO.LOW)
+                GPIO.output(SORTING_DATA_PIN_LSB, GPIO.LOW)
+                print("Ensured sorting pins are LOW after error.")
+        except Exception as e_cleanup: print(f"Warning: Could not reset pins after error: {e_cleanup}")
+
+# ==============================
+# === View Switching Logic ===
+# ==============================
+def calibrate_and_show_live_view():
+    """Re-arms the trigger, runs a calibration, and shows the live view."""
+    global g_accepting_triggers
+    print("\n--- 'Classify Another' clicked: Re-arming GPIO trigger ---")
+    g_accepting_triggers = True # Re-arm the system
+    calibrate_sensors(is_manual_call=True) 
+    show_live_view()
+
+def show_live_view():
+    global live_view_frame, results_view_frame
+    if results_view_frame and results_view_frame.winfo_ismapped():
+        results_view_frame.pack_forget()
+    if live_view_frame and not live_view_frame.winfo_ismapped():
+        live_view_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+def show_results_view():
+    global live_view_frame, results_view_frame
+    if live_view_frame and live_view_frame.winfo_ismapped():
+        live_view_frame.pack_forget()
+    if results_view_frame and not results_view_frame.winfo_ismapped():
+        results_view_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+# ============================
+# === Screenshot Function ===
+# ============================
+def save_result_screenshot(image_pil, prediction, confidence, mag_text, ldc_text):
+    """Creates and saves a composite image of the results."""
+    global BASE_PATH, TESTING_FOLDER_NAME, RESULT_IMG_DISPLAY_WIDTH
+
+    print("\n--- Saving Result Screenshot ---")
+    testing_folder = os.path.join(BASE_PATH, TESTING_FOLDER_NAME)
+
+    try:
+        os.makedirs(testing_folder, exist_ok=True)
+    except Exception as e:
+        print(f"ERROR: Cannot create/access testing folder '{testing_folder}': {e}")
+        messagebox.showerror("Save Error", f"Could not create/access folder:\n{testing_folder}")
+        return
+
+    i = 1
+    while True:
+        filename = os.path.join(testing_folder, f"data_{i}.png")
+        if not os.path.exists(filename):
+            break
+        i += 1
+        if i > 9999:
+            print("ERROR: More than 9999 result files exist. Cannot save.")
+            messagebox.showerror("Save Error", "Too many result files exist.")
+            return
+
+    # --- Create Composite Image ---
+    IMG_WIDTH = 400; IMG_HEIGHT = 600; BG_COLOR = "white"; TEXT_COLOR = "black"
+    MARGIN = 20; IMG_DISPLAY_WIDTH_SS = RESULT_IMG_DISPLAY_WIDTH; FONT_SIZE_TITLE = 20
+    FONT_SIZE_TEXT = 16; LINE_SPACING = 5
+
+    try:
+        try:
+            font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", FONT_SIZE_TITLE)
+            font_text = ImageFont.truetype("DejaVuSans.ttf", FONT_SIZE_TEXT)
+        except IOError:
+            print("Warning: DejaVu fonts not found, using default PIL font.")
+            font_title = ImageFont.load_default()
+            font_text = ImageFont.load_default()
+
+        ss_img = Image.new('RGB', (IMG_WIDTH, IMG_HEIGHT), BG_COLOR)
+        draw = ImageDraw.Draw(ss_img)
+        y_pos = MARGIN
+        title_w, title_h = draw.textsize("Classification Result", font=font_title)
+        draw.text(((IMG_WIDTH - title_w) / 2, y_pos), "Classification Result", fill=TEXT_COLOR, font=font_title)
+        y_pos += title_h + 15
+        w, h_img = image_pil.size
+        aspect = h_img / w if w > 0 else 0.75
+        display_h = int(IMG_DISPLAY_WIDTH_SS * aspect) if aspect > 0 else int(IMG_DISPLAY_WIDTH_SS * 0.75)
+        img_disp = image_pil.resize((IMG_DISPLAY_WIDTH_SS, max(1, display_h)), Image.Resampling.LANCZOS)
+        img_x = (IMG_WIDTH - IMG_DISPLAY_WIDTH_SS) // 2
+        ss_img.paste(img_disp, (img_x, y_pos))
+        y_pos += display_h + 20
+        details = [
+            (f"Material:", f"{prediction}", font_title),
+            (f"Confidence:", f"{confidence:.1%}", font_text),
+            ("--- Sensor Values ---", "", font_text),
+            (f" Magnetism:", f"{mag_text}", font_text),
+            (f" LDC Reading:", f"{ldc_text}", font_text),
+        ]
+        max_label_w = 0
+        for label, _, font in details:
+            lw, _ = draw.textsize(label, font=font)
+            max_label_w = max(max_label_w, lw)
+        value_x = MARGIN + max_label_w + 10
+        for label, value, font in details:
+            _, lh = draw.textsize("A", font=font)
+            if value:
+                draw.text((MARGIN, y_pos), label, fill=TEXT_COLOR, font=font)
+                draw.text((value_x, y_pos), value, fill=TEXT_COLOR, font=font)
+            else:
+                draw.text((MARGIN, y_pos), label, fill=TEXT_COLOR, font=font)
+            y_pos += lh + LINE_SPACING
+        ss_img.save(filename)
+        print(f"Result saved successfully to: {filename}")
+    except Exception as e:
+        print(f"ERROR: Failed to create or save screenshot: {e}")
+        traceback.print_exc()
+        messagebox.showerror("Save Error", f"Failed to save screenshot:\n{e}")
+
+# ======================
+# === GUI Functions ===
+# ======================
+def create_placeholder_image(width, height, color='#E0E0E0', text="No Image"):
+    try:
+        pil_img = Image.new('RGB', (width, height), color); tk_img = ImageTk.PhotoImage(pil_img)
+        return tk_img
+    except Exception as e: print(f"Warning: Failed to create placeholder image: {e}"); return None
+
+def clear_results_display():
+    global rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label, placeholder_img_tk
+    if rv_image_label:
+        if placeholder_img_tk: rv_image_label.config(image=placeholder_img_tk, text=""); rv_image_label.img_tk = placeholder_img_tk
+        else: rv_image_label.config(image='', text="No Image"); rv_image_label.img_tk = None
+    default_text = "---"
+    if rv_prediction_label: rv_prediction_label.config(text=default_text)
+    if rv_confidence_label: rv_confidence_label.config(text=default_text)
+    if rv_magnetism_label: rv_magnetism_label.config(text=default_text)
+    if rv_ldc_label: rv_ldc_label.config(text=default_text)
 
 def capture_and_classify():
     global window, camera, IDLE_VOLTAGE, IDLE_RP_VALUE
-    global visual_interpreter, magnetism_interpreter, resistivity_interpreter
     global rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label
-    global save_output_var
-    global g_accepting_triggers
+    global save_output_var, g_accepting_triggers
+    global interpreter_visual, interpreter_magnetism, interpreter_resistivity
 
-    # --- MODIFICATION: Disarm the trigger as soon as we start processing ---
+    # --- Disarm the trigger as soon as we start processing ---
     g_accepting_triggers = False
-    print("\n" + "="*10 + " Multi-AI Classification Triggered (System Paused) " + "="*10)
-    
-    # Check if at least one AI model is ready
-    if not (visual_interpreter or magnetism_interpreter or resistivity_interpreter):
-        messagebox.showerror("Error", "No AI Models are initialized. Cannot classify.")
-        print("Classification aborted: No AI models ready.")
-        show_live_view()
-        return
-        
+    print("\n" + "="*10 + " Automatic Classification Triggered (System Paused) " + "="*10)
+
+    # --- Pre-flight Checks ---
+    if not all([interpreter_visual, interpreter_magnetism, interpreter_resistivity]):
+        messagebox.showerror("Error", "One or more AI Models are not initialized. Cannot classify.")
+        print("Classification aborted: AI not ready."); show_live_view(); return
     if not camera or not camera.isOpened():
         messagebox.showerror("Error", "Camera is not available. Cannot capture image.")
-        print("Classification aborted: Camera not ready.")
-        show_live_view()
-        return
+        print("Classification aborted: Camera not ready."); show_live_view(); return
 
     window.update_idletasks()
 
-    # Capture image
+    # --- Capture Image ---
     ret, frame = camera.read()
     if not ret or frame is None:
         messagebox.showerror("Capture Error", "Failed to capture image from camera.")
-        print("ERROR: Failed to read frame from camera.")
-        show_live_view()
-        return
-        
+        print("ERROR: Failed to read frame from camera."); show_live_view(); return
     try:
         img_captured_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     except Exception as e:
         messagebox.showerror("Image Error", f"Failed to process captured image: {e}")
-        print(f"ERROR: Failed converting captured frame to PIL Image: {e}")
-        show_live_view()
-        return
+        print(f"ERROR: Failed converting captured frame to PIL Image: {e}"); show_live_view(); return
 
-    # --- SENSOR READING SECTION ---
-    print(f"Capturing fresh sensor values for multi-AI classification...")
-    mag_display_text, sensor_warning = "N/A", False
-    current_mag_mT = None
+    # --- Capture Sensor Data ---
+    print(f"Capturing fresh sensor values for classification...")
     
-    # Get magnetism reading
+    # Magnetism Reading
+    current_mag_mT = None
     avg_v_capture = get_averaged_hall_voltage(num_samples=NUM_SAMPLES_CALIBRATION)
     if avg_v_capture is not None and abs(SENSITIVITY_V_PER_MILLITESLA) > 1e-9:
-        try:
-            current_mag_mT = (avg_v_capture - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
-            
-            # Format display text
-            if abs(current_mag_mT) < 0.1:
-                mag_display_text = f"{current_mag_mT * 1000:+.1f}µT"
-            else:
-                mag_display_text = f"{current_mag_mT:+.2f}mT"
-            
-            if IDLE_VOLTAGE == 0.0:
-                mag_display_text += " (NoCal)"
-        except Exception as e_calc: 
-            mag_display_text = "CalcErr"
-            print(f"Warn: Magnetism calculation for capture failed: {e_calc}")
-            sensor_warning = True
+        current_mag_mT = (avg_v_capture - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
     else:
-        mag_display_text = "ReadErr"
         print("ERROR: Hall sensor read failed during capture.")
-        sensor_warning = True
 
-    # Get resistivity reading
+    # LDC Reading
+    current_rp_raw = None
     avg_rp_val = get_averaged_rp_data(num_samples=NUM_SAMPLES_CALIBRATION)
-    current_rp_raw, ldc_display_text = None, "N/A"
     if avg_rp_val is not None:
         current_rp_raw = avg_rp_val
-        current_rp_int = int(round(avg_rp_val))
-        delta_rp_display = current_rp_int - IDLE_RP_VALUE
-        ldc_display_text = f"{current_rp_int}"
-        if IDLE_RP_VALUE != 0:
-            ldc_display_text += f" (Δ{delta_rp_display:+,})"
-        else:
-            ldc_display_text += " (NoCal)"
     else:
-        ldc_display_text = "ReadErr"
-        print("ERROR: LDC read fail.")
-        sensor_warning = True
+        print("ERROR: LDC read failed during capture.")
+
+    # --- Preprocess Data for Each Model ---
+    print("\n--- Preprocessing all inputs ---")
+
+    # Use the absolute value of magnetism for the AI input, but keep the
+    # original signed value for display purposes.
+    magnetism_for_ai = None
+    if current_mag_mT is not None:
+        magnetism_for_ai = abs(current_mag_mT)
+        print(f"Original magnetism: {current_mag_mT:+.4f}mT, Using absolute value for AI: {magnetism_for_ai:.4f}mT")
+
+    visual_input = preprocess_visual_input(img_captured_pil, input_details_visual)
+    magnetism_input = preprocess_numerical_input(magnetism_for_ai, 'magnetism', input_details_magnetism)
+    resistivity_input = preprocess_numerical_input(current_rp_raw, 'resistivity', input_details_resistivity)
+    
+    # --- Run Inference on Each Model ---
+    print("\n--- Running inference on all models ---")
+    output_visual = run_single_inference(interpreter_visual, input_details_visual, visual_input)
+    output_magnetism = run_single_inference(interpreter_magnetism, input_details_magnetism, magnetism_input)
+    output_resistivity = run_single_inference(interpreter_resistivity, input_details_resistivity, resistivity_input)
+
+    # --- Combine Results with Hierarchical Logic ---
+    model_outputs = {
+        'visual': output_visual,
+        'magnetism': output_magnetism,
+        'resistivity': output_resistivity
+    }
+    predicted_label, confidence = postprocess_hierarchical_output(model_outputs)
+    
+    print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
+
+    # --- Handle Saving and Sorting ---
+    mag_display_text = ""
+    if current_mag_mT is not None:
+        if abs(current_mag_mT) < 1:
+            mag_display_text = f"{current_mag_mT * 1000:+.1f}µT"
+        else:
+            mag_display_text = f"{current_mag_mT:+.2f}mT"
+    else:
+        mag_display_text = "ReadErr"
         
-    if sensor_warning:
-        print("WARNING: Sensor issues may affect classification.")
+    ldc_display_text = f"{int(round(current_rp_raw))}" if current_rp_raw is not None else "ReadErr"
 
-    # --- MULTI-AI INFERENCE SECTION ---
-    print("=== Starting Multi-AI Inference ===")
-    
-    # Preprocess inputs for each AI model
-    visual_input = preprocess_visual_input(img_captured_pil) if visual_interpreter else None
-    magnetism_input = preprocess_magnetism_input(current_mag_mT) if magnetism_interpreter else None
-    resistivity_input = preprocess_resistivity_input(current_rp_raw) if resistivity_interpreter else None
-    
-    # Run inference on each available model
-    visual_output = run_visual_inference(visual_input) if visual_input is not None else None
-    magnetism_output = run_magnetism_inference(magnetism_input) if magnetism_input is not None else None
-    resistivity_output = run_resistivity_inference(resistivity_input) if resistivity_input is not None else None
-    
-    # Combine predictions from all models
-    predicted_label, confidence = combine_predictions(visual_output, magnetism_output, resistivity_output)
-    
-    print(f"--- Multi-AI Classification Result: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
-
-    # Save result if requested
     if save_output_var and save_output_var.get() == 1:
         save_result_screenshot(img_captured_pil, predicted_label, confidence, mag_display_text, ldc_display_text)
 
-    # Send sorting signal
     send_sorting_signal(predicted_label)
 
-    # Update Results Display
+    # --- Update Results Display ---
     if rv_image_label:
         try:
             w, h_img = img_captured_pil.size; aspect = h_img/w if w>0 else 0.75
@@ -853,6 +898,7 @@ def capture_and_classify():
             print(f"ERROR: Results image update: {e}")
             if placeholder_img_tk: rv_image_label.config(image=placeholder_img_tk, text="ImgErr"); rv_image_label.img_tk = placeholder_img_tk
             else: rv_image_label.config(image='', text="ImgErr"); rv_image_label.img_tk = None
+            
     if rv_prediction_label: rv_prediction_label.config(text=f"{predicted_label}")
     if rv_confidence_label: rv_confidence_label.config(text=f"{confidence:.1%}")
     if rv_magnetism_label: rv_magnetism_label.config(text=mag_display_text)
@@ -861,9 +907,16 @@ def capture_and_classify():
     show_results_view()
     print("="*10 + " Capture & Classify Complete " + "="*10 + "\n")
 
+# ### MODIFIED FUNCTION ###
 def calibrate_sensors(is_manual_call=False):
-    global IDLE_VOLTAGE, IDLE_RP_VALUE
+    global IDLE_VOLTAGE, IDLE_RP_VALUE, g_last_live_magnetism_mT
     global hall_sensor, ldc_initialized
+
+    # NEW: Only perform auto-calibration if the sensor is truly idle
+    # This prevents the baseline from being reset when a material is present.
+    # A threshold of 2.0 µT (0.002 mT) is a safe "zero" point.
+    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 1.2:
+        return # Exit the function, do not recalibrate
 
     if is_manual_call:
         print("\n" + "="*10 + " Manual Sensor Calibration Triggered " + "="*10)
@@ -925,11 +978,10 @@ def update_magnetism():
                 # Calculate magnetism directly from the averaged voltage
                 current_mT = (avg_v - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
                 
-                # Store this raw value for other parts of the app if needed (though capture now does its own reading)
                 g_last_live_magnetism_mT = current_mT
 
                 # Format the display text based on the magnitude
-                if abs(current_mT) < 0.1:
+                if abs(current_mT) < 1:
                     display_text = f"{current_mT * 1000:+.1f}µT"
                 else:
                     display_text = f"{current_mT:+.2f}mT"
@@ -951,32 +1003,37 @@ def update_magnetism():
         window.after(GUI_UPDATE_INTERVAL_MS, update_magnetism)
 
 def update_ldc_reading():
-    global lv_ldc_label, window, RP_DISPLAY_BUFFER, IDLE_RP_VALUE, ldc_initialized
+    global lv_ldc_label, window, IDLE_RP_VALUE, ldc_initialized
     if not window or not window.winfo_exists(): return
     display_text = "N/A"
     if ldc_initialized:
+        # Get a single, median-averaged reading for this update cycle.
+        # This provides a bit of smoothing against noise spikes, but is "rawer"
+        # because it doesn't smooth over multiple update cycles.
         avg_rp = get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE)
         if avg_rp is not None:
-            RP_DISPLAY_BUFFER.append(avg_rp)
-            if RP_DISPLAY_BUFFER:
-                cur_rp = int(round(statistics.mean(RP_DISPLAY_BUFFER)))
-                delta = cur_rp - IDLE_RP_VALUE
-                display_text = f"{cur_rp}"
-                if IDLE_RP_VALUE != 0: display_text += f"(Δ{delta:+,})"
-                else: display_text += "(NoCal)"
-            else: display_text = "Buffer..."
-        else: display_text = "ReadErr"
-    if lv_ldc_label and lv_ldc_label.cget("text") != display_text: lv_ldc_label.config(text=display_text)
-    if window and window.winfo_exists(): window.after(GUI_UPDATE_INTERVAL_MS, update_ldc_reading)
+            # The RP_DISPLAY_BUFFER is no longer used, making the display more responsive.
+            cur_rp = int(round(avg_rp))
+            delta = cur_rp - IDLE_RP_VALUE
+            display_text = f"{cur_rp}"
+            if IDLE_RP_VALUE != 0:
+                display_text += f" (Δ{delta:+,})"
+            else:
+                display_text += " (NoCal)"
+        else:
+            display_text = "ReadErr"
+    if lv_ldc_label and lv_ldc_label.cget("text") != display_text:
+        lv_ldc_label.config(text=display_text)
+    if window and window.winfo_exists():
+        window.after(GUI_UPDATE_INTERVAL_MS, update_ldc_reading)
 
-# --- MODIFIED: Automation loop now checks the g_accepting_triggers flag ---
 def manage_automation_flow():
     """
     Checks the GPIO pin to manage calibration and classification.
-    - If pin is LOW: Calibrates every 0.5 seconds.
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
+    - After 10 consecutive LOW reads: Triggers an auto-calibration.
     """
-    global window, g_previous_control_state, g_last_calibration_time, g_accepting_triggers
+    global window, g_previous_control_state, g_accepting_triggers, g_low_pulse_counter
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
 
     if not window or not window.winfo_exists(): return
@@ -994,14 +1051,20 @@ def manage_automation_flow():
         # RISING EDGE (LOW -> HIGH): Trigger classification if system is armed
         if g_accepting_triggers and current_state == GPIO.HIGH and g_previous_control_state == GPIO.LOW:
             print(f"AUTOMATION: Armed and rising edge detected. Scheduling classification...")
+            g_low_pulse_counter = 0 # Reset counter on a rising edge
             window.after(2000, capture_and_classify) # 2s delay
         
-        # STATE IS LOW: Perform periodic calibration
+        # STATE IS HIGH (but not a rising edge): Reset counter
+        elif current_state == GPIO.HIGH:
+            g_low_pulse_counter = 0
+
+        # STATE IS LOW: Increment counter and check for calibration
         elif current_state == GPIO.LOW:
-            current_time = time.time()
-            if (current_time - g_last_calibration_time) >= 0.5:
+            g_low_pulse_counter += 1
+            if g_low_pulse_counter >= 10:
+                # print("AUTOMATION: 10 consecutive LOW states detected. Auto-calibrating...") # Uncomment for debug
                 calibrate_sensors(is_manual_call=False)
-                g_last_calibration_time = current_time
+                g_low_pulse_counter = 0 # Reset after calibrating
 
         g_previous_control_state = current_state
 
@@ -1024,7 +1087,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.22 (RPi - Gated Automation)")
+    window.title("AI Metal Classifier v3.0.28 (RPi - Hierarchical Ensemble)")
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
@@ -1098,7 +1161,7 @@ def setup_gui():
 # ==========================
 def run_application():
     global window, lv_camera_label, lv_magnetism_label, lv_ldc_label
-    global visual_interpreter, magnetism_interpreter, resistivity_interpreter, camera, hall_sensor, ldc_initialized
+    global camera, hall_sensor, ldc_initialized
 
     print("Setting up GUI...")
     try: setup_gui()
@@ -1169,12 +1232,16 @@ def cleanup_resources():
 # === Main Entry Point =====
 # ==========================
 if __name__ == '__main__':
-    print("="*30 + "\n Starting AI Metal Classifier (RPi Gated Automation) \n" + "="*30)
+    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30)
     hw_init_attempted = False
     try:
         initialize_hardware(); hw_init_attempted = True
-        initialize_ai()
-        run_application()
+        if initialize_ai(): # Only run the app if AI models load successfully
+            run_application()
+        else:
+            print("\nApplication cannot start due to AI initialization failure.")
+            messagebox.showerror("AI Init Error", "Could not load AI models. Please check console for details.")
+            
     except KeyboardInterrupt: print("\nKeyboard interrupt detected. Exiting application.")
     except Exception as e:
         print("\n" + "="*30 + f"\nFATAL ERROR in main execution: {e}\n" + "="*30); traceback.print_exc()
