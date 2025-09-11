@@ -1,0 +1,4 @@
+Aluminum
+Copper
+Others
+Steel
