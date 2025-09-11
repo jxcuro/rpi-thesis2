@@ -143,17 +143,18 @@ MODEL_WEIGHTS = {
 }
 
 # --- Hardcoded Scaler Parameters ---
-# NOTE: Replace these placeholder values with the actual mean and scale
-#       values from your trained scalers. Each list should have one value
-#       per feature the model expects (e.g., [value1] for 1 feature).
+# NOTE: These values have been updated based on the trained scalers.
+# IMPORTANT: The Resistivity model expects TWO features (ldc_rp, delta_rp).
+#            The current code in `capture_and_classify` only provides ONE.
+#            This will need to be adjusted for the resistivity model to work correctly.
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [-0.00045692951015531655],
-        'scale': [0.0007746215855280234]
+        'mean': [-0.00045693],
+        'scale': [0.00077462]
     },
     'resistivity': {
-        'mean': [60919.882915173235],
-        'scale': [1474.1832947534347]
+        'mean': [60919.88291517, -670.29390681],
+        'scale': [1474.18329475, 1479.38300319]
     }
 }
 # =========================================
