@@ -141,8 +141,8 @@ MAGNETISM_THRESHOLD_mT = 0.0012 # Defines the cutoff for what is considered "mag
 
 # Weights to use WHEN an object IS detected as magnetic
 MAGNETIC_WEIGHTS = {
-    'visual': 0.6,
-    'magnetism': 0.4,  # Trust the magnetism model completely
+    'visual': 0.5,
+    'magnetism': 0.5,  # Trust the magnetism model completely
     'resistivity': 0.0
 }
 
