@@ -4,6 +4,8 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.24 - MODIFIED: Added a rule-based override to force "Steel" classification
+#                  -           if magnetism is > 1.0µT.
 # Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
 #                  -           TFLite models (Visual, Magnetism, Resistivity).
 #                  - MODIFIED: Implemented a weighted-average system to combine model outputs.
@@ -855,6 +857,20 @@ def capture_and_classify():
     
     print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
 
+    # === START MODIFICATION: Rule-based override for high magnetism ===
+    # If a significant magnetic field is detected (> 1.0µT or 0.001mT),
+    # override any non-ferromagnetic classification to "Steel".
+    # This acts as a safety net against model misclassifications for ferrous metals.
+    MAGNETISM_OVERRIDE_THRESHOLD_MT = 0.001 # Corresponds to 1.0µT
+    if current_mag_mT is not None and abs(current_mag_mT) > MAGNETISM_OVERRIDE_THRESHOLD_MT:
+        if predicted_label in ["Aluminum", "Copper", "Others"]:
+            original_prediction = predicted_label
+            predicted_label = "Steel"
+            confidence = 0.999 # Set a high confidence to reflect the override
+            print(f"!!! MAGNETIC OVERRIDE: Strong magnetism ({current_mag_mT:+.3f}mT) detected.")
+            print(f"    Original AI prediction '{original_prediction}' overridden to '{predicted_label}'.")
+    # === END MODIFICATION ===
+
     # --- Handle Saving and Sorting ---
     # ### CORRECTED SECTION ###
     mag_display_text = ""
@@ -1055,7 +1071,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.23 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.24 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
