@@ -4,6 +4,8 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.27 - NEW: Added a 'MAGNETISM_SENSITIVITY_MULTIPLIER' constant to allow
+#                  -      for easy software-based tuning of the magnetic sensor readings.
 # Version: 3.0.26 - IMPROVED: Averaging logic for sensor readings now uses the median
 #                  -           instead of the mean. This provides more robust noise
 #                  -           rejection against outlier data spikes.
@@ -174,6 +176,11 @@ AI_IMG_HEIGHT = 224
 
 HALL_ADC_CHANNEL = ADS.P0 if I2C_ENABLED else None
 SENSITIVITY_V_PER_TESLA = 0.0004
+# ### NEW ### - Software multiplier to increase/decrease magnetic sensitivity.
+#             - Increase this value if readings are consistently too low for magnetic
+#               materials (e.g., set to 10.0, 20.0, etc.).
+#             - Decrease if readings are too high or noisy.
+MAGNETISM_SENSITIVITY_MULTIPLIER = 10.0 # Default was 1.0
 SENSITIVITY_V_PER_MILLITESLA = SENSITIVITY_V_PER_TESLA * 1000
 IDLE_VOLTAGE = 0.0
 
@@ -832,7 +839,8 @@ def capture_and_classify():
     current_mag_mT = None
     avg_v_capture = get_averaged_hall_voltage(num_samples=NUM_SAMPLES_CALIBRATION)
     if avg_v_capture is not None and abs(SENSITIVITY_V_PER_MILLITESLA) > 1e-9:
-        current_mag_mT = (avg_v_capture - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
+        # ### MODIFIED ### - Apply the sensitivity multiplier to the reading
+        current_mag_mT = ((avg_v_capture - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA) * MAGNETISM_SENSITIVITY_MULTIPLIER
     else:
         print("ERROR: Hall sensor read failed during capture.")
 
@@ -976,8 +984,9 @@ def update_magnetism():
             try:
                 if abs(SENSITIVITY_V_PER_MILLITESLA) < 1e-9:
                     raise ZeroDivisionError("Sensitivity is zero")
-                # Calculate magnetism directly from the averaged voltage
-                current_mT = (avg_v - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
+                # ### MODIFIED ### - Apply the sensitivity multiplier to the reading
+                # Calculate magnetism directly from the averaged voltage and apply multiplier
+                current_mT = ((avg_v - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA) * MAGNETISM_SENSITIVITY_MULTIPLIER
                 
                 g_last_live_magnetism_mT = current_mT
 
@@ -1084,7 +1093,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.26 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.27 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
