@@ -4,6 +4,9 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.25 - FIXED:      Removed continuous auto-calibration which could create a faulty
+#                  -           baseline. Calibration now only occurs on startup and when
+#                  -           the 'Classify Another' button is pressed.
 # Version: 3.0.24 - MODIFIED: Added a rule-based override to force "Steel" classification
 #                  -           if magnetism is > 1.0µT.
 # Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
@@ -1019,9 +1022,9 @@ def update_ldc_reading():
 
 def manage_automation_flow():
     """
-    Checks the GPIO pin to manage calibration and classification.
-    - If pin is LOW: Calibrates every 0.5 seconds.
+    Checks the GPIO pin to manage classification triggers.
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
+    - Continuous auto-calibration has been REMOVED to ensure a stable baseline.
     """
     global window, g_previous_control_state, g_last_calibration_time, g_accepting_triggers
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
@@ -1043,12 +1046,18 @@ def manage_automation_flow():
             print(f"AUTOMATION: Armed and rising edge detected. Scheduling classification...")
             window.after(2000, capture_and_classify) # 2s delay
         
-        # STATE IS LOW: Perform periodic calibration
-        elif current_state == GPIO.LOW:
-            current_time = time.time()
-            if (current_time - g_last_calibration_time) >= 0.5:
-                calibrate_sensors(is_manual_call=False)
-                g_last_calibration_time = current_time
+        # ### MODIFICATION ###
+        # The following block for auto-calibration when the state is LOW has been removed.
+        # This prevents the system from setting an incorrect idle baseline if an object
+        # is present on the sensor during the idle phase. Calibration is now only
+        # performed explicitly on startup and when "Classify Another" is clicked.
+        
+        # # STATE IS LOW: Perform periodic calibration (REMOVED)
+        # elif current_state == GPIO.LOW:
+        #     current_time = time.time()
+        #     if (current_time - g_last_calibration_time) >= 0.5:
+        #         calibrate_sensors(is_manual_call=False)
+        #         g_last_calibration_time = current_time
 
         g_previous_control_state = current_state
 
@@ -1071,7 +1080,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.24 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.25 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
@@ -1154,6 +1163,10 @@ def run_application():
         try: root_err = tk.Tk(); root_err.withdraw(); messagebox.showerror("GUI Setup Error", f"GUI Init Failed:\n{e}\n\nConsole for details."); root_err.destroy()
         except Exception: pass
         return
+
+    # ### MODIFICATION ### - Perform an initial calibration on startup
+    print("Performing initial sensor calibration...")
+    calibrate_sensors(is_manual_call=True)
 
     # Initial state of GUI elements
     if not camera and lv_camera_label: lv_camera_label.configure(text="Camera Failed", image='')
