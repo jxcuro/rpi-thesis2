@@ -865,12 +865,14 @@ def capture_and_classify():
     # override any non-ferromagnetic classification to "Steel".
     # This acts as a safety net against model misclassifications for ferrous metals.
     MAGNETISM_OVERRIDE_THRESHOLD_MT = 0.001 # Corresponds to 1.0µT
-    if current_mag_mT is not None and abs(current_mag_mT) > MAGNETISM_OVERRIDE_THRESHOLD_MT and current_rp_raw is not None and current_rp_raw < 57000:
+    
+    # **FIXED**: Added a check for the magnetism model's weight to make the override conditional.
+    if MODEL_WEIGHTS['magnetism'] > 0 and current_mag_mT is not None and abs(current_mag_mT) > MAGNETISM_OVERRIDE_THRESHOLD_MT:
         if predicted_label in ["Aluminum", "Copper", "Others"]:
             original_prediction = predicted_label
             predicted_label = "Steel"
             confidence = 0.999 # Set a high confidence to reflect the override
-            print(f"!!! MAGNETIC OVERRIDE: Strong magnetism ({current_mag_mT:+.3f}mT) and low RP ({current_rp_raw}) detected.")
+            print(f"!!! MAGNETIC OVERRIDE: Strong magnetism ({current_mag_mT:+.3f}mT) detected.")
             print(f"    Original AI prediction '{original_prediction}' overridden to '{predicted_label}'.")
     # === END MODIFICATION ===
 
