@@ -915,7 +915,7 @@ def calibrate_sensors(is_manual_call=False):
     # NEW: Only perform auto-calibration if the sensor is truly idle
     # This prevents the baseline from being reset when a material is present.
     # A threshold of 2.0 µT (0.002 mT) is a safe "zero" point.
-    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 1.5:
+    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 1.2:
         return # Exit the function, do not recalibrate
 
     if is_manual_call:
