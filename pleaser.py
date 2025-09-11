@@ -4,9 +4,26 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
-# Version: 3.0.24 - MODIFIED: Updated scaler parameters for magnetism and resistivity models.
-#                  - MODIFIED: Adjusted hierarchical model weights based on sensor reliability feedback.
-#                  - MODIFIED: Adapted data preprocessing to support multi-feature numerical models (for new resistivity model).
+# Version: 3.0.28 - FIXED: Magnetism reading instability by implementing "smart"
+#                  -           auto-calibration. The system now checks if a magnetic
+#                  -           field is present before recalibrating the idle voltage,
+#                  -           preventing the baseline from being incorrectly reset.
+# Version: 3.0.27 - MODIFIED: LDC display is now "rawer", similar to magnetism-test.py.
+#                  -           Removed the temporal smoothing buffer (RP_DISPLAY_BUFFER) to make
+#                  -           the live reading more responsive. A small amount of smoothing is
+#                  -           retained by taking the median of a few fast samples per update.
+# Version: 3.0.26 - IMPROVED: Averaging logic for sensor readings now uses the median
+#                  -           instead of the mean. This provides more robust noise
+#                  -           rejection against outlier data spikes.
+# Version: 3.0.25 - MODIFIED: Magnetism display logic updated to match 'magnetism-test.py'.
+#                  -           The display now switches from milliTesla (mT) to microTesla (µT)
+#                  -           when the absolute magnetism value is less than 1.0 mT.
+# Version: 3.0.24 - MODIFIED: Now uses the absolute value of the magnetism reading as input
+#                  -           for the magnetism AI model. The signed value is still
+#                  -           displayed in the results for user context.
+# Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
+#                  -           TFLite models (Visual, Magnetism, Resistivity).
+#                  - MODIFIED: Implemented a weighted-average system to combine model outputs.
 #                  - REMOVED:  Removed joblib dependency; scaler parameters are now hardcoded.
 # FIXED:       Potential mismatch between sensor data processing and scaler expectation.
 # DEBUG:       Enhanced prints in capture_and_classify, preprocess_input, run_inference, postprocess_output.
@@ -38,14 +55,6 @@ except ImportError:
         print("ERROR: TensorFlow Lite Runtime is not installed.")
         print("Please install it (e.g., 'pip install tflite-runtime' or follow official Pi instructions)")
         exit()
-
-# ### REMOVED ### - Joblib is no longer needed
-# try:
-#     import joblib
-# except ImportError:
-#     print("ERROR: Joblib is not installed.")
-#     print("Please install it: pip install joblib")
-#     exit()
 
 # --- I2C/ADS1115 Imports (for Hall Sensor/Magnetism) ---
 I2C_ENABLED = False # Default to False, set True if libraries import successfully
@@ -136,7 +145,6 @@ MODEL_RESISTIVITY_PATH = os.path.join(BASE_PATH, MODEL_RESISTIVITY_FILENAME)
 LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 
 # --- Hierarchical Weights (Must sum to 1.0) ---
-# MODIFIED: Adjusted weights based on sensor reliability. Resistivity is highest, magnetism is lowest.
 MODEL_WEIGHTS = {
     'visual': 0.0,
     'magnetism': 0.0,
@@ -149,12 +157,12 @@ MODEL_WEIGHTS = {
 #       per feature the model expects (e.g., [value1] for 1 feature).
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [0.00048415711947626843],  # Updated Mean of magnetism training data
-        'scale': [0.0007762457818081904]   # Updated Std Dev of magnetism training data
+        'mean': [0.00048415711947626843],  # Example: Mean of magnetism training data
+        'scale': [0.0007762457818081904]  # Example: Std Dev of magnetism training data
     },
     'resistivity': {
-        'mean': [61000.82880523732],   # Updated Mean of LDC RP training data
-        'scale': [1362.7716526399417]    # Updated Std Dev of LDC RP training data
+        'mean': [61000.82880523732], # Example: Mean of LDC RP training data
+        'scale': [1362.7716526399417]   # Example: Std Dev of LDC RP training data
     }
 }
 # =========================================
@@ -165,7 +173,7 @@ AI_IMG_WIDTH = 224
 AI_IMG_HEIGHT = 224
 
 HALL_ADC_CHANNEL = ADS.P0 if I2C_ENABLED else None
-SENSITIVITY_V_PER_TESLA = 0.0002
+SENSITIVITY_V_PER_TESLA = 0.0004
 SENSITIVITY_V_PER_MILLITESLA = SENSITIVITY_V_PER_TESLA * 1000
 IDLE_VOLTAGE = 0.0
 
@@ -213,7 +221,7 @@ main_frame = None
 live_view_frame = None
 results_view_frame = None
 label_font, readout_font, button_font, title_font, result_title_font, result_value_font, pred_font = (None,) * 7
-lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4 
+lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4
 rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label, rv_classify_another_button = (None,) * 6
 placeholder_img_tk = None
 save_output_var = None
@@ -221,7 +229,7 @@ save_output_var = None
 # --- NEW: State for Gated GPIO Automation ---
 g_accepting_triggers = True     # Controls if the system will respond to a GPIO signal
 g_previous_control_state = None # Tracks GPIO 23 state to detect rising edges
-g_last_calibration_time = 0     # Timestamp of the last auto-calibration
+g_low_pulse_counter = 0         # Counts consecutive LOW reads for calibration trigger
 
 # =========================
 # === Hardware Setup ===
@@ -351,7 +359,6 @@ def initialize_hardware():
 # =========================
 # === AI Model Setup ======
 # =========================
-# ### MODIFIED ### - Function to initialize all three AI models
 def initialize_ai():
     global loaded_labels
     global interpreter_visual, input_details_visual, output_details_visual
@@ -498,7 +505,8 @@ def get_averaged_hall_voltage(num_samples=NUM_SAMPLES_PER_UPDATE):
     for _ in range(num_samples):
         try: readings.append(hall_sensor.voltage)
         except Exception as e: print(f"Warning: Error reading Hall sensor: {e}. Aborting average."); return None
-    if readings: return statistics.mean(readings)
+    # ### IMPROVED: Use median to be more robust against outlier noise spikes ###
+    if readings: return statistics.median(readings)
     else: return None
 
 def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
@@ -507,13 +515,13 @@ def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
     for _ in range(num_samples):
         rp_value = get_ldc_rpdata()
         if rp_value is not None: readings.append(rp_value)
-    if readings: return statistics.mean(readings)
+    # ### IMPROVED: Use median to be more robust against outlier noise spikes ###
+    if readings: return statistics.median(readings)
     else: return None
 
 # ==========================
 # === AI Processing ========
 # ==========================
-# ### NEW ### - Preprocessing functions for each model type
 def preprocess_visual_input(image_pil, input_details):
     """Prepares image data for the visual model."""
     if not input_details: return None
@@ -529,7 +537,7 @@ def preprocess_visual_input(image_pil, input_details):
         return None
 
 def preprocess_numerical_input(value, model_type, input_details):
-    """Prepares and scales a single numerical value or a list of values for a sensor model."""
+    """Prepares and scales a single numerical value for a sensor model."""
     if value is None or not input_details: return None
     try:
         # Get scaler params for the specific model
@@ -538,31 +546,18 @@ def preprocess_numerical_input(value, model_type, input_details):
             print(f"ERROR: No scaler parameters defined for model type '{model_type}'.")
             return None
         
-        # MODIFIED: Handle single value or list of values for multi-feature models
-        if isinstance(value, (list, tuple)):
-            raw_value = np.array([value], dtype=np.float32) # Shape -> [[feat1, feat2, ...]]
-        else:
-            raw_value = np.array([[float(value)]], dtype=np.float32) # Shape -> [[feat1]]
+        raw_value = np.array([[float(value)]], dtype=np.float32)
         
         # Manual scaling: (value - mean) / scale
         mean = np.array(params['mean'], dtype=np.float32)
         scale = np.array(params['scale'], dtype=np.float32)
-
-        # Sanity check for feature mismatch
-        if raw_value.shape[1] != len(params['mean']):
-            print(f"ERROR: Preprocessing feature count mismatch for '{model_type}'.")
-            print(f"       Input has {raw_value.shape[1]} features, but scaler expects {len(params['mean'])}.")
-            return None
-
         scaled_value = (raw_value - mean) / scale
         
         return scaled_value.astype(input_details[0]['dtype'])
     except Exception as e:
         print(f"ERROR: Numerical preprocessing for {model_type} failed: {e}")
-        traceback.print_exc()
         return None
 
-# ### NEW ### - Function to run inference on a single model
 def run_single_inference(interpreter, input_details, processed_input):
     """Runs inference on a single TFLite interpreter."""
     if interpreter is None or processed_input is None:
@@ -579,7 +574,6 @@ def run_single_inference(interpreter, input_details, processed_input):
         traceback.print_exc()
         return None
 
-# ### NEW ### - Postprocessing with hierarchical weighted average
 def postprocess_hierarchical_output(outputs):
     global loaded_labels, MODEL_WEIGHTS
     print("\n--- Postprocessing AI Outputs (Hierarchical) ---")
@@ -795,7 +789,6 @@ def clear_results_display():
     if rv_magnetism_label: rv_magnetism_label.config(text=default_text)
     if rv_ldc_label: rv_ldc_label.config(text=default_text)
 
-# ### MODIFIED ### - Main classification logic using the hierarchical model system
 def capture_and_classify():
     global window, camera, IDLE_VOLTAGE, IDLE_RP_VALUE
     global rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label
@@ -838,25 +831,27 @@ def capture_and_classify():
     else:
         print("ERROR: Hall sensor read failed during capture.")
 
-    # LDC Reading (MODIFIED for two features: raw and delta)
+    # LDC Reading
     current_rp_raw = None
-    current_rp_delta = None
-    resistivity_features = None
     avg_rp_val = get_averaged_rp_data(num_samples=NUM_SAMPLES_CALIBRATION)
     if avg_rp_val is not None:
         current_rp_raw = avg_rp_val
-        current_rp_delta = current_rp_raw - IDLE_RP_VALUE
-        resistivity_features = [current_rp_raw, current_rp_delta]
     else:
         print("ERROR: LDC read failed during capture.")
 
-
     # --- Preprocess Data for Each Model ---
     print("\n--- Preprocessing all inputs ---")
+
+    # Use the absolute value of magnetism for the AI input, but keep the
+    # original signed value for display purposes.
+    magnetism_for_ai = None
+    if current_mag_mT is not None:
+        magnetism_for_ai = abs(current_mag_mT)
+        print(f"Original magnetism: {current_mag_mT:+.4f}mT, Using absolute value for AI: {magnetism_for_ai:.4f}mT")
+
     visual_input = preprocess_visual_input(img_captured_pil, input_details_visual)
-    magnetism_input = preprocess_numerical_input(current_mag_mT, 'magnetism', input_details_magnetism)
-    # MODIFIED: Pass the list of features to the preprocessor
-    resistivity_input = preprocess_numerical_input(resistivity_features, 'resistivity', input_details_resistivity)
+    magnetism_input = preprocess_numerical_input(magnetism_for_ai, 'magnetism', input_details_magnetism)
+    resistivity_input = preprocess_numerical_input(current_rp_raw, 'resistivity', input_details_resistivity)
     
     # --- Run Inference on Each Model ---
     print("\n--- Running inference on all models ---")
@@ -877,7 +872,7 @@ def capture_and_classify():
     # --- Handle Saving and Sorting ---
     mag_display_text = ""
     if current_mag_mT is not None:
-        if abs(current_mag_mT) < 0.1:
+        if abs(current_mag_mT) < 1:
             mag_display_text = f"{current_mag_mT * 1000:+.1f}µT"
         else:
             mag_display_text = f"{current_mag_mT:+.2f}mT"
@@ -885,9 +880,6 @@ def capture_and_classify():
         mag_display_text = "ReadErr"
         
     ldc_display_text = f"{int(round(current_rp_raw))}" if current_rp_raw is not None else "ReadErr"
-    if current_rp_delta is not None:
-        ldc_display_text += f" (Δ{current_rp_delta:+,})"
-
 
     if save_output_var and save_output_var.get() == 1:
         save_result_screenshot(img_captured_pil, predicted_label, confidence, mag_display_text, ldc_display_text)
@@ -915,9 +907,16 @@ def capture_and_classify():
     show_results_view()
     print("="*10 + " Capture & Classify Complete " + "="*10 + "\n")
 
+# ### MODIFIED FUNCTION ###
 def calibrate_sensors(is_manual_call=False):
-    global IDLE_VOLTAGE, IDLE_RP_VALUE
+    global IDLE_VOLTAGE, IDLE_RP_VALUE, g_last_live_magnetism_mT
     global hall_sensor, ldc_initialized
+
+    # NEW: Only perform auto-calibration if the sensor is truly idle
+    # This prevents the baseline from being reset when a material is present.
+    # A threshold of 2.0 µT (0.002 mT) is a safe "zero" point.
+    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 1.2:
+        return # Exit the function, do not recalibrate
 
     if is_manual_call:
         print("\n" + "="*10 + " Manual Sensor Calibration Triggered " + "="*10)
@@ -982,7 +981,7 @@ def update_magnetism():
                 g_last_live_magnetism_mT = current_mT
 
                 # Format the display text based on the magnitude
-                if abs(current_mT) < 0.1:
+                if abs(current_mT) < 1:
                     display_text = f"{current_mT * 1000:+.1f}µT"
                 else:
                     display_text = f"{current_mT:+.2f}mT"
@@ -1004,31 +1003,37 @@ def update_magnetism():
         window.after(GUI_UPDATE_INTERVAL_MS, update_magnetism)
 
 def update_ldc_reading():
-    global lv_ldc_label, window, RP_DISPLAY_BUFFER, IDLE_RP_VALUE, ldc_initialized
+    global lv_ldc_label, window, IDLE_RP_VALUE, ldc_initialized
     if not window or not window.winfo_exists(): return
     display_text = "N/A"
     if ldc_initialized:
+        # Get a single, median-averaged reading for this update cycle.
+        # This provides a bit of smoothing against noise spikes, but is "rawer"
+        # because it doesn't smooth over multiple update cycles.
         avg_rp = get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE)
         if avg_rp is not None:
-            RP_DISPLAY_BUFFER.append(avg_rp)
-            if RP_DISPLAY_BUFFER:
-                cur_rp = int(round(statistics.mean(RP_DISPLAY_BUFFER)))
-                delta = cur_rp - IDLE_RP_VALUE
-                display_text = f"{cur_rp}"
-                if IDLE_RP_VALUE != 0: display_text += f"(Δ{delta:+,})"
-                else: display_text += "(NoCal)"
-            else: display_text = "Buffer..."
-        else: display_text = "ReadErr"
-    if lv_ldc_label and lv_ldc_label.cget("text") != display_text: lv_ldc_label.config(text=display_text)
-    if window and window.winfo_exists(): window.after(GUI_UPDATE_INTERVAL_MS, update_ldc_reading)
+            # The RP_DISPLAY_BUFFER is no longer used, making the display more responsive.
+            cur_rp = int(round(avg_rp))
+            delta = cur_rp - IDLE_RP_VALUE
+            display_text = f"{cur_rp}"
+            if IDLE_RP_VALUE != 0:
+                display_text += f" (Δ{delta:+,})"
+            else:
+                display_text += " (NoCal)"
+        else:
+            display_text = "ReadErr"
+    if lv_ldc_label and lv_ldc_label.cget("text") != display_text:
+        lv_ldc_label.config(text=display_text)
+    if window and window.winfo_exists():
+        window.after(GUI_UPDATE_INTERVAL_MS, update_ldc_reading)
 
 def manage_automation_flow():
     """
     Checks the GPIO pin to manage calibration and classification.
-    - If pin is LOW: Calibrates every 0.5 seconds.
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
+    - After 10 consecutive LOW reads: Triggers an auto-calibration.
     """
-    global window, g_previous_control_state, g_last_calibration_time, g_accepting_triggers
+    global window, g_previous_control_state, g_accepting_triggers, g_low_pulse_counter
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
 
     if not window or not window.winfo_exists(): return
@@ -1046,14 +1051,20 @@ def manage_automation_flow():
         # RISING EDGE (LOW -> HIGH): Trigger classification if system is armed
         if g_accepting_triggers and current_state == GPIO.HIGH and g_previous_control_state == GPIO.LOW:
             print(f"AUTOMATION: Armed and rising edge detected. Scheduling classification...")
+            g_low_pulse_counter = 0 # Reset counter on a rising edge
             window.after(2000, capture_and_classify) # 2s delay
         
-        # STATE IS LOW: Perform periodic calibration
+        # STATE IS HIGH (but not a rising edge): Reset counter
+        elif current_state == GPIO.HIGH:
+            g_low_pulse_counter = 0
+
+        # STATE IS LOW: Increment counter and check for calibration
         elif current_state == GPIO.LOW:
-            current_time = time.time()
-            if (current_time - g_last_calibration_time) >= 0.5:
+            g_low_pulse_counter += 1
+            if g_low_pulse_counter >= 10:
+                # print("AUTOMATION: 10 consecutive LOW states detected. Auto-calibrating...") # Uncomment for debug
                 calibrate_sensors(is_manual_call=False)
-                g_last_calibration_time = current_time
+                g_low_pulse_counter = 0 # Reset after calibrating
 
         g_previous_control_state = current_state
 
@@ -1076,7 +1087,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.24 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.28 (RPi - Hierarchical Ensemble)")
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
@@ -1221,7 +1232,7 @@ def cleanup_resources():
 # === Main Entry Point =====
 # ==========================
 if __name__ == '__main__':
-    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30) # ### MODIFIED ###
+    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30)
     hw_init_attempted = False
     try:
         initialize_hardware(); hw_init_attempted = True
