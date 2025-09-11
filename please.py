@@ -4,6 +4,9 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.26 - IMPROVED: Averaging logic for sensor readings now uses the median
+#                  -           instead of the mean. This provides more robust noise
+#                  -           rejection against outlier data spikes.
 # Version: 3.0.25 - MODIFIED: Magnetism display logic updated to match 'magnetism-test.py'.
 #                  -           The display now switches from milliTesla (mT) to microTesla (µT)
 #                  -           when the absolute magnetism value is less than 1.0 mT.
@@ -503,7 +506,8 @@ def get_averaged_hall_voltage(num_samples=NUM_SAMPLES_PER_UPDATE):
     for _ in range(num_samples):
         try: readings.append(hall_sensor.voltage)
         except Exception as e: print(f"Warning: Error reading Hall sensor: {e}. Aborting average."); return None
-    if readings: return statistics.mean(readings)
+    # ### IMPROVED: Use median to be more robust against outlier noise spikes ###
+    if readings: return statistics.median(readings)
     else: return None
 
 def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
@@ -512,7 +516,8 @@ def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
     for _ in range(num_samples):
         rp_value = get_ldc_rpdata()
         if rp_value is not None: readings.append(rp_value)
-    if readings: return statistics.mean(readings)
+    # ### IMPROVED: Use median to be more robust against outlier noise spikes ###
+    if readings: return statistics.median(readings)
     else: return None
 
 # ==========================
@@ -1008,7 +1013,8 @@ def update_ldc_reading():
         if avg_rp is not None:
             RP_DISPLAY_BUFFER.append(avg_rp)
             if RP_DISPLAY_BUFFER:
-                cur_rp = int(round(statistics.mean(RP_DISPLAY_BUFFER)))
+                # ### IMPROVED: Use median for the display buffer as well ###
+                cur_rp = int(round(statistics.median(RP_DISPLAY_BUFFER)))
                 delta = cur_rp - IDLE_RP_VALUE
                 display_text = f"{cur_rp}"
                 if IDLE_RP_VALUE != 0: display_text += f"(Δ{delta:+,})"
@@ -1072,7 +1078,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.25 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.26 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
