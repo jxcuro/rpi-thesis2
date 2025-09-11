@@ -137,9 +137,9 @@ LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 
 # --- Hierarchical Weights (Must sum to 1.0) ---
 MODEL_WEIGHTS = {
-    'visual': 0.3,
-    'magnetism': 0.35,
-    'resistivity': 0.35
+    'visual': 0.0,
+    'magnetism': 1.0,
+    'resistivity': 0.0
 }
 
 # --- Hardcoded Scaler Parameters ---
@@ -148,12 +148,12 @@ MODEL_WEIGHTS = {
 #       per feature the model expects (e.g., [value1] for 1 feature).
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [0.0],  # Example: Mean of magnetism training data
-        'scale': [1.0]  # Example: Std Dev of magnetism training data
+        'mean': [-0.01960512],  # Example: Mean of magnetism training data
+        'scale': [3.21212715]  # Example: Std Dev of magnetism training data
     },
     'resistivity': {
-        'mean': [24500.0], # Example: Mean of LDC RP training data
-        'scale': [500.0]   # Example: Std Dev of LDC RP training data
+        'mean': [60780.67241379], # Example: Mean of LDC RP training data
+        'scale': [1543.13269432]   # Example: Std Dev of LDC RP training data
     }
 }
 # =========================================
