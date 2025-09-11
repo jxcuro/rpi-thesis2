@@ -4,11 +4,6 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
-# Version: 3.0.25 - FIXED:      Removed continuous auto-calibration which could create a faulty
-#                  -           baseline. Calibration now only occurs on startup and when
-#                  -           the 'Classify Another' button is pressed.
-# Version: 3.0.24 - MODIFIED: Added a rule-based override to force "Steel" classification
-#                  -           if magnetism is > 1.0µT.
 # Version: 3.0.23 - MODIFIED: Replaced single AI model with a hierarchical ensemble of three
 #                  -           TFLite models (Visual, Magnetism, Resistivity).
 #                  - MODIFIED: Implemented a weighted-average system to combine model outputs.
@@ -153,12 +148,12 @@ MODEL_WEIGHTS = {
 #       per feature the model expects (e.g., [value1] for 1 feature).
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [-0.01960512],  # Example: Mean of magnetism training data
-        'scale': [3.21212715]  # Example: Std Dev of magnetism training data
+        'mean': [-0.00045692951015531655],
+        'scale': [0.0007746215855280234]
     },
     'resistivity': {
-        'mean': [60780.67241379], # Example: Mean of LDC RP training data
-        'scale': [1543.13269432]   # Example: Std Dev of LDC RP training data
+        'mean': [60919.882915173235],
+        'scale': [1474.1832947534347]
     }
 }
 # =========================================
@@ -860,22 +855,6 @@ def capture_and_classify():
     
     print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
 
-    # === START MODIFICATION: Rule-based override for high magnetism ===
-    # If a significant magnetic field is detected (> 1.0µT or 0.001mT),
-    # override any non-ferromagnetic classification to "Steel".
-    # This acts as a safety net against model misclassifications for ferrous metals.
-    MAGNETISM_OVERRIDE_THRESHOLD_MT = 0.001 # Corresponds to 1.0µT
-    
-    # **FIXED**: Added a check for the magnetism model's weight to make the override conditional.
-    if MODEL_WEIGHTS['magnetism'] > 0 and current_mag_mT is not None and abs(current_mag_mT) > MAGNETISM_OVERRIDE_THRESHOLD_MT:
-        if predicted_label in ["Aluminum", "Copper", "Others"]:
-            original_prediction = predicted_label
-            predicted_label = "Steel"
-            confidence = 0.999 # Set a high confidence to reflect the override
-            print(f"!!! MAGNETIC OVERRIDE: Strong magnetism ({current_mag_mT:+.3f}mT) detected.")
-            print(f"    Original AI prediction '{original_prediction}' overridden to '{predicted_label}'.")
-    # === END MODIFICATION ===
-
     # --- Handle Saving and Sorting ---
     # ### CORRECTED SECTION ###
     mag_display_text = ""
@@ -1024,9 +1003,9 @@ def update_ldc_reading():
 
 def manage_automation_flow():
     """
-    Checks the GPIO pin to manage classification triggers.
+    Checks the GPIO pin to manage calibration and classification.
+    - If pin is LOW: Calibrates every 0.5 seconds.
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
-    - Continuous auto-calibration has been REMOVED to ensure a stable baseline.
     """
     global window, g_previous_control_state, g_last_calibration_time, g_accepting_triggers
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
@@ -1048,18 +1027,12 @@ def manage_automation_flow():
             print(f"AUTOMATION: Armed and rising edge detected. Scheduling classification...")
             window.after(2000, capture_and_classify) # 2s delay
         
-        # ### MODIFICATION ###
-        # The following block for auto-calibration when the state is LOW has been removed.
-        # This prevents the system from setting an incorrect idle baseline if an object
-        # is present on the sensor during the idle phase. Calibration is now only
-        # performed explicitly on startup and when "Classify Another" is clicked.
-        
-        # # STATE IS LOW: Perform periodic calibration (REMOVED)
-        # elif current_state == GPIO.LOW:
-        #     current_time = time.time()
-        #     if (current_time - g_last_calibration_time) >= 0.5:
-        #         calibrate_sensors(is_manual_call=False)
-        #         g_last_calibration_time = current_time
+        # STATE IS LOW: Perform periodic calibration
+        elif current_state == GPIO.LOW:
+            current_time = time.time()
+            if (current_time - g_last_calibration_time) >= 0.5:
+                calibrate_sensors(is_manual_call=False)
+                g_last_calibration_time = current_time
 
         g_previous_control_state = current_state
 
@@ -1082,7 +1055,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.25 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.23 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
@@ -1165,10 +1138,6 @@ def run_application():
         try: root_err = tk.Tk(); root_err.withdraw(); messagebox.showerror("GUI Setup Error", f"GUI Init Failed:\n{e}\n\nConsole for details."); root_err.destroy()
         except Exception: pass
         return
-
-    # ### MODIFICATION ### - Perform an initial calibration on startup
-    print("Performing initial sensor calibration...")
-    calibrate_sensors(is_manual_call=True)
 
     # Initial state of GUI elements
     if not camera and lv_camera_label: lv_camera_label.configure(text="Camera Failed", image='')
