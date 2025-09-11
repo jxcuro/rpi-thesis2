@@ -141,16 +141,16 @@ MAGNETISM_THRESHOLD_mT = 0.0012 # Defines the cutoff for what is considered "mag
 
 # Weights to use WHEN an object IS detected as magnetic
 MAGNETIC_WEIGHTS = {
-    'visual': 0.0,
-    'magnetism': 1.0,  # Trust the magnetism model completely
+    'visual': 0.6,
+    'magnetism': 0.4,  # Trust the magnetism model completely
     'resistivity': 0.0
 }
 
 # Weights to use WHEN an object is NOT detected as magnetic
 NON_MAGNETIC_WEIGHTS = {
-    'visual': 0.7,     # Visual model is the primary classifier
+    'visual': 0.5,     # Visual model is the primary classifier
     'magnetism': 0.0,  # Ignore the magnetism model's opinion on non-magnetic types
-    'resistivity': 0.3 # Resistivity is a strong tie-breaker between visual similarities
+    'resistivity': 0.5 # Resistivity is a strong tie-breaker between visual similarities
 }
 
 # --- Hardcoded Scaler Parameters ---
