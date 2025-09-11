@@ -229,7 +229,7 @@ save_output_var = None
 # --- NEW: State for Gated GPIO Automation ---
 g_accepting_triggers = True     # Controls if the system will respond to a GPIO signal
 g_previous_control_state = None # Tracks GPIO 23 state to detect rising edges
-g_last_calibration_time = 0     # Timestamp of the last auto-calibration
+g_low_pulse_counter = 0         # Counts consecutive LOW reads for calibration trigger
 
 # =========================
 # === Hardware Setup ===
@@ -1027,10 +1027,10 @@ def update_ldc_reading():
 def manage_automation_flow():
     """
     Checks the GPIO pin to manage calibration and classification.
-    - If pin is LOW: Calibrates every 0.5 seconds.
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
+    - After 5 consecutive LOW reads: Triggers an auto-calibration.
     """
-    global window, g_previous_control_state, g_last_calibration_time, g_accepting_triggers
+    global window, g_previous_control_state, g_accepting_triggers, g_low_pulse_counter
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
 
     if not window or not window.winfo_exists(): return
@@ -1048,14 +1048,20 @@ def manage_automation_flow():
         # RISING EDGE (LOW -> HIGH): Trigger classification if system is armed
         if g_accepting_triggers and current_state == GPIO.HIGH and g_previous_control_state == GPIO.LOW:
             print(f"AUTOMATION: Armed and rising edge detected. Scheduling classification...")
+            g_low_pulse_counter = 0 # Reset counter on a rising edge
             window.after(2000, capture_and_classify) # 2s delay
         
-        # STATE IS LOW: Perform periodic calibration
+        # STATE IS HIGH (but not a rising edge): Reset counter
+        elif current_state == GPIO.HIGH:
+            g_low_pulse_counter = 0
+
+        # STATE IS LOW: Increment counter and check for calibration
         elif current_state == GPIO.LOW:
-            current_time = time.time()
-            if (current_time - g_last_calibration_time) >= 0.5:
+            g_low_pulse_counter += 1
+            if g_low_pulse_counter >= 5:
+                # print("AUTOMATION: 5 consecutive LOW states detected. Auto-calibrating...") # Uncomment for debug
                 calibrate_sensors(is_manual_call=False)
-                g_last_calibration_time = current_time
+                g_low_pulse_counter = 0 # Reset after calibrating
 
         g_previous_control_state = current_state
 
