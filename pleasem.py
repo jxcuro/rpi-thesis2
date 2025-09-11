@@ -143,17 +143,15 @@ MODEL_WEIGHTS = {
 }
 
 # --- Hardcoded Scaler Parameters ---
-# NOTE: Replace these placeholder values with the actual mean and scale
-#       values from your trained scalers. Each list should have one value
-#       per feature the model expects (e.g., [value1] for 1 feature).
+# ### MODIFIED ### - Updated scaler values from user input
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [-9.880281690140848e-05],
-        'scale': [0.0007954837153584703]
+        'mean': [-4.762684124386253e-05],
+        'scale': [0.0009136177067612571]
     },
     'resistivity': {
-        'mean': [61052.39612676],
-        'scale': [1099.90647768]
+        'mean': [61000.82880524, -592.15384615],
+        'scale': [1362.77165264, 1365.00623593]
     }
 }
 # =========================================
@@ -212,7 +210,7 @@ main_frame = None
 live_view_frame = None
 results_view_frame = None
 label_font, readout_font, button_font, title_font, result_title_font, result_value_font, pred_font = (None,) * 7
-lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4 
+lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4
 rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label, rv_classify_another_button = (None,) * 6
 placeholder_img_tk = None
 save_output_var = None
@@ -527,8 +525,9 @@ def preprocess_visual_input(image_pil, input_details):
         print(f"ERROR: Visual preprocessing failed: {e}")
         return None
 
+# ### MODIFIED ### - Now handles both scalar and list/array inputs
 def preprocess_numerical_input(value, model_type, input_details):
-    """Prepares and scales a single numerical value for a sensor model."""
+    """Prepares and scales numerical value(s) for a sensor model."""
     if value is None or not input_details: return None
     try:
         # Get scaler params for the specific model
@@ -537,17 +536,30 @@ def preprocess_numerical_input(value, model_type, input_details):
             print(f"ERROR: No scaler parameters defined for model type '{model_type}'.")
             return None
         
-        raw_value = np.array([[float(value)]], dtype=np.float32)
-        
+        # Handle both scalar and list/array inputs
+        if np.isscalar(value):
+             # Ensure a single value is treated as a 1-feature sample
+             raw_value = np.array([[float(value)]], dtype=np.float32)
+        else:
+             # Assume value is a list or array of features for a single sample
+             raw_value = np.array([value], dtype=np.float32)
+
         # Manual scaling: (value - mean) / scale
         mean = np.array(params['mean'], dtype=np.float32)
         scale = np.array(params['scale'], dtype=np.float32)
+
+        # Check for shape mismatch before scaling
+        if raw_value.shape[1] != len(params['mean']):
+            print(f"ERROR: Feature count mismatch for {model_type}. Model expects {len(params['mean'])} features, but got {raw_value.shape[1]}.")
+            return None
+
         scaled_value = (raw_value - mean) / scale
         
         return scaled_value.astype(input_details[0]['dtype'])
     except Exception as e:
         print(f"ERROR: Numerical preprocessing for {model_type} failed: {e}")
         return None
+
 
 # ### NEW ### - Function to run inference on a single model
 def run_single_inference(interpreter, input_details, processed_input):
@@ -663,7 +675,7 @@ def calibrate_and_show_live_view():
     global g_accepting_triggers
     print("\n--- 'Classify Another' clicked: Re-arming GPIO trigger ---")
     g_accepting_triggers = True # Re-arm the system
-    calibrate_sensors(is_manual_call=True) 
+    calibrate_sensors(is_manual_call=True)
     show_live_view()
 
 def show_live_view():
@@ -825,11 +837,13 @@ def capture_and_classify():
     else:
         print("ERROR: Hall sensor read failed during capture.")
 
-    # LDC Reading
+    # ### MODIFIED ### - Capture LDC and calculate delta for 2-feature model
     current_rp_raw = None
+    delta_rp = None
     avg_rp_val = get_averaged_rp_data(num_samples=NUM_SAMPLES_CALIBRATION)
     if avg_rp_val is not None:
         current_rp_raw = avg_rp_val
+        delta_rp = current_rp_raw - IDLE_RP_VALUE
     else:
         print("ERROR: LDC read failed during capture.")
 
@@ -837,8 +851,10 @@ def capture_and_classify():
     print("\n--- Preprocessing all inputs ---")
     visual_input = preprocess_visual_input(img_captured_pil, input_details_visual)
     magnetism_input = preprocess_numerical_input(current_mag_mT, 'magnetism', input_details_magnetism)
-    resistivity_input = preprocess_numerical_input(current_rp_raw, 'resistivity', input_details_resistivity)
-    
+    # ### MODIFIED ### - Pass both LDC features as a list
+    resistivity_features = [current_rp_raw, delta_rp] if current_rp_raw is not None and delta_rp is not None else None
+    resistivity_input = preprocess_numerical_input(resistivity_features, 'resistivity', input_details_resistivity)
+
     # --- Run Inference on Each Model ---
     print("\n--- Running inference on all models ---")
     output_visual = run_single_inference(interpreter_visual, input_details_visual, visual_input)
@@ -856,7 +872,6 @@ def capture_and_classify():
     print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
 
     # --- Handle Saving and Sorting ---
-    # ### CORRECTED SECTION ###
     mag_display_text = ""
     if current_mag_mT is not None:
         if abs(current_mag_mT) < 0.1:
@@ -866,7 +881,10 @@ def capture_and_classify():
     else:
         mag_display_text = "ReadErr"
         
-    ldc_display_text = f"{int(round(current_rp_raw))}" if current_rp_raw is not None else "ReadErr"
+    # ### MODIFIED ### - Update LDC display text to include delta
+    ldc_display_text = "ReadErr"
+    if current_rp_raw is not None and delta_rp is not None:
+        ldc_display_text = f"{int(round(current_rp_raw))} (Δ{int(round(delta_rp)):+,})"
 
     if save_output_var and save_output_var.get() == 1:
         save_result_screenshot(img_captured_pil, predicted_label, confidence, mag_display_text, ldc_display_text)
@@ -1048,10 +1066,10 @@ def manage_automation_flow():
 # ======================
 def setup_gui():
     global window, main_frame, placeholder_img_tk, live_view_frame, results_view_frame
-    global lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox 
+    global lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox
     global rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label, rv_classify_another_button
     global label_font, readout_font, button_font, title_font, result_title_font, result_value_font, pred_font
-    global save_output_var 
+    global save_output_var
 
     print("Setting up GUI...")
     window = tk.Tk()
@@ -1092,9 +1110,9 @@ def setup_gui():
     
     status_label_font = tkFont.Font(family="DejaVu Sans", size=10, weight="bold")
     ttk.Label(
-        lv_actions_frame, 
-        text="Automated Control Active", 
-        font=status_label_font, 
+        lv_actions_frame,
+        text="Automated Control Active",
+        font=status_label_font,
         foreground="#006400" # Dark Green
     ).grid(row=0, column=0, sticky="ew", pady=(4,8))
     
@@ -1148,7 +1166,7 @@ def run_application():
     update_camera_feed()
     update_magnetism()
     update_ldc_reading()
-    manage_automation_flow() 
+    manage_automation_flow()
 
     print("Starting Tkinter main loop... (Press Ctrl+C in console to exit)")
     try:
