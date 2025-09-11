@@ -4,6 +4,10 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.27 - MODIFIED: LDC display is now "rawer", similar to magnetism-test.py.
+#                  -           Removed the temporal smoothing buffer (RP_DISPLAY_BUFFER) to make
+#                  -           the live reading more responsive. A small amount of smoothing is
+#                  -           retained by taking the median of a few fast samples per update.
 # Version: 3.0.26 - IMPROVED: Averaging logic for sensor readings now uses the median
 #                  -           instead of the mean. This provides more robust noise
 #                  -           rejection against outlier data spikes.
@@ -1005,24 +1009,29 @@ def update_magnetism():
         window.after(GUI_UPDATE_INTERVAL_MS, update_magnetism)
 
 def update_ldc_reading():
-    global lv_ldc_label, window, RP_DISPLAY_BUFFER, IDLE_RP_VALUE, ldc_initialized
+    global lv_ldc_label, window, IDLE_RP_VALUE, ldc_initialized
     if not window or not window.winfo_exists(): return
     display_text = "N/A"
     if ldc_initialized:
+        # Get a single, median-averaged reading for this update cycle.
+        # This provides a bit of smoothing against noise spikes, but is "rawer"
+        # because it doesn't smooth over multiple update cycles.
         avg_rp = get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE)
         if avg_rp is not None:
-            RP_DISPLAY_BUFFER.append(avg_rp)
-            if RP_DISPLAY_BUFFER:
-                # ### IMPROVED: Use median for the display buffer as well ###
-                cur_rp = int(round(statistics.median(RP_DISPLAY_BUFFER)))
-                delta = cur_rp - IDLE_RP_VALUE
-                display_text = f"{cur_rp}"
-                if IDLE_RP_VALUE != 0: display_text += f"(Δ{delta:+,})"
-                else: display_text += "(NoCal)"
-            else: display_text = "Buffer..."
-        else: display_text = "ReadErr"
-    if lv_ldc_label and lv_ldc_label.cget("text") != display_text: lv_ldc_label.config(text=display_text)
-    if window and window.winfo_exists(): window.after(GUI_UPDATE_INTERVAL_MS, update_ldc_reading)
+            # The RP_DISPLAY_BUFFER is no longer used, making the display more responsive.
+            cur_rp = int(round(avg_rp))
+            delta = cur_rp - IDLE_RP_VALUE
+            display_text = f"{cur_rp}"
+            if IDLE_RP_VALUE != 0:
+                display_text += f" (Δ{delta:+,})"
+            else:
+                display_text += " (NoCal)"
+        else:
+            display_text = "ReadErr"
+    if lv_ldc_label and lv_ldc_label.cget("text") != display_text:
+        lv_ldc_label.config(text=display_text)
+    if window and window.winfo_exists():
+        window.after(GUI_UPDATE_INTERVAL_MS, update_ldc_reading)
 
 def manage_automation_flow():
     """
@@ -1084,7 +1093,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.26 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.27 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
