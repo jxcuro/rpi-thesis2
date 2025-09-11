@@ -4,6 +4,9 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.25 - MODIFIED: Magnetism display logic updated to match 'magnetism-test.py'.
+#                  -           The display now switches from milliTesla (mT) to microTesla (µT)
+#                  -           when the absolute magnetism value is less than 1.0 mT.
 # Version: 3.0.24 - MODIFIED: Now uses the absolute value of the magnetism reading as input
 #                  -           for the magnetism AI model. The signed value is still
 #                  -           displayed in the results for user context.
@@ -215,7 +218,7 @@ main_frame = None
 live_view_frame = None
 results_view_frame = None
 label_font, readout_font, button_font, title_font, result_title_font, result_value_font, pred_font = (None,) * 7
-lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4 
+lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox = (None,) * 4
 rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label, rv_classify_another_button = (None,) * 6
 placeholder_img_tk = None
 save_output_var = None
@@ -871,7 +874,8 @@ def capture_and_classify():
     # --- Handle Saving and Sorting ---
     mag_display_text = ""
     if current_mag_mT is not None:
-        if abs(current_mag_mT) < 0.1:
+        # ### MODIFIED: Use the logic from magnetism-test.py (threshold is 1) ###
+        if abs(current_mag_mT) < 1:
             mag_display_text = f"{current_mag_mT * 1000:+.1f}µT"
         else:
             mag_display_text = f"{current_mag_mT:+.2f}mT"
@@ -972,8 +976,9 @@ def update_magnetism():
                 
                 g_last_live_magnetism_mT = current_mT
 
+                # ### MODIFIED: Use the logic from magnetism-test.py (threshold is 1) ###
                 # Format the display text based on the magnitude
-                if abs(current_mT) < 0.1:
+                if abs(current_mT) < 1:
                     display_text = f"{current_mT * 1000:+.1f}µT"
                 else:
                     display_text = f"{current_mT:+.2f}mT"
@@ -1067,7 +1072,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.24 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.25 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
