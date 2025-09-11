@@ -4,6 +4,10 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# Version: 3.0.28 - FIXED: Magnetism reading instability by implementing "smart"
+#                  -           auto-calibration. The system now checks if a magnetic
+#                  -           field is present before recalibrating the idle voltage,
+#                  -           preventing the baseline from being incorrectly reset.
 # Version: 3.0.27 - MODIFIED: LDC display is now "rawer", similar to magnetism-test.py.
 #                  -           Removed the temporal smoothing buffer (RP_DISPLAY_BUFFER) to make
 #                  -           the live reading more responsive. A small amount of smoothing is
@@ -51,14 +55,6 @@ except ImportError:
         print("ERROR: TensorFlow Lite Runtime is not installed.")
         print("Please install it (e.g., 'pip install tflite-runtime' or follow official Pi instructions)")
         exit()
-
-# ### REMOVED ### - Joblib is no longer needed
-# try:
-#     import joblib
-# except ImportError:
-#     print("ERROR: Joblib is not installed.")
-#     print("Please install it: pip install joblib")
-#     exit()
 
 # --- I2C/ADS1115 Imports (for Hall Sensor/Magnetism) ---
 I2C_ENABLED = False # Default to False, set True if libraries import successfully
@@ -363,7 +359,6 @@ def initialize_hardware():
 # =========================
 # === AI Model Setup ======
 # =========================
-# ### MODIFIED ### - Function to initialize all three AI models
 def initialize_ai():
     global loaded_labels
     global interpreter_visual, input_details_visual, output_details_visual
@@ -527,7 +522,6 @@ def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
 # ==========================
 # === AI Processing ========
 # ==========================
-# ### NEW ### - Preprocessing functions for each model type
 def preprocess_visual_input(image_pil, input_details):
     """Prepares image data for the visual model."""
     if not input_details: return None
@@ -564,7 +558,6 @@ def preprocess_numerical_input(value, model_type, input_details):
         print(f"ERROR: Numerical preprocessing for {model_type} failed: {e}")
         return None
 
-# ### NEW ### - Function to run inference on a single model
 def run_single_inference(interpreter, input_details, processed_input):
     """Runs inference on a single TFLite interpreter."""
     if interpreter is None or processed_input is None:
@@ -581,7 +574,6 @@ def run_single_inference(interpreter, input_details, processed_input):
         traceback.print_exc()
         return None
 
-# ### NEW ### - Postprocessing with hierarchical weighted average
 def postprocess_hierarchical_output(outputs):
     global loaded_labels, MODEL_WEIGHTS
     print("\n--- Postprocessing AI Outputs (Hierarchical) ---")
@@ -797,7 +789,6 @@ def clear_results_display():
     if rv_magnetism_label: rv_magnetism_label.config(text=default_text)
     if rv_ldc_label: rv_ldc_label.config(text=default_text)
 
-# ### MODIFIED ### - Main classification logic using the hierarchical model system
 def capture_and_classify():
     global window, camera, IDLE_VOLTAGE, IDLE_RP_VALUE
     global rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label
@@ -851,14 +842,12 @@ def capture_and_classify():
     # --- Preprocess Data for Each Model ---
     print("\n--- Preprocessing all inputs ---")
 
-    # ### MODIFIED SECTION START ###
     # Use the absolute value of magnetism for the AI input, but keep the
     # original signed value for display purposes.
     magnetism_for_ai = None
     if current_mag_mT is not None:
         magnetism_for_ai = abs(current_mag_mT)
         print(f"Original magnetism: {current_mag_mT:+.4f}mT, Using absolute value for AI: {magnetism_for_ai:.4f}mT")
-    # ### MODIFIED SECTION END ###
 
     visual_input = preprocess_visual_input(img_captured_pil, input_details_visual)
     magnetism_input = preprocess_numerical_input(magnetism_for_ai, 'magnetism', input_details_magnetism)
@@ -883,7 +872,6 @@ def capture_and_classify():
     # --- Handle Saving and Sorting ---
     mag_display_text = ""
     if current_mag_mT is not None:
-        # ### MODIFIED: Use the logic from magnetism-test.py (threshold is 1) ###
         if abs(current_mag_mT) < 1:
             mag_display_text = f"{current_mag_mT * 1000:+.1f}µT"
         else:
@@ -919,9 +907,16 @@ def capture_and_classify():
     show_results_view()
     print("="*10 + " Capture & Classify Complete " + "="*10 + "\n")
 
+# ### MODIFIED FUNCTION ###
 def calibrate_sensors(is_manual_call=False):
-    global IDLE_VOLTAGE, IDLE_RP_VALUE
+    global IDLE_VOLTAGE, IDLE_RP_VALUE, g_last_live_magnetism_mT
     global hall_sensor, ldc_initialized
+
+    # NEW: Only perform auto-calibration if the sensor is truly idle
+    # This prevents the baseline from being reset when a material is present.
+    # A threshold of 2.0 µT (0.002 mT) is a safe "zero" point.
+    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 2.0:
+        return # Exit the function, do not recalibrate
 
     if is_manual_call:
         print("\n" + "="*10 + " Manual Sensor Calibration Triggered " + "="*10)
@@ -985,7 +980,6 @@ def update_magnetism():
                 
                 g_last_live_magnetism_mT = current_mT
 
-                # ### MODIFIED: Use the logic from magnetism-test.py (threshold is 1) ###
                 # Format the display text based on the magnitude
                 if abs(current_mT) < 1:
                     display_text = f"{current_mT * 1000:+.1f}µT"
@@ -1037,7 +1031,7 @@ def manage_automation_flow():
     """
     Checks the GPIO pin to manage calibration and classification.
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
-    - After 5 consecutive LOW reads: Triggers an auto-calibration.
+    - After 10 consecutive LOW reads: Triggers an auto-calibration.
     """
     global window, g_previous_control_state, g_accepting_triggers, g_low_pulse_counter
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
@@ -1068,7 +1062,7 @@ def manage_automation_flow():
         elif current_state == GPIO.LOW:
             g_low_pulse_counter += 1
             if g_low_pulse_counter >= 10:
-                # print("AUTOMATION: 5 consecutive LOW states detected. Auto-calibrating...") # Uncomment for debug
+                # print("AUTOMATION: 10 consecutive LOW states detected. Auto-calibrating...") # Uncomment for debug
                 calibrate_sensors(is_manual_call=False)
                 g_low_pulse_counter = 0 # Reset after calibrating
 
@@ -1093,7 +1087,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.27 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.28 (RPi - Hierarchical Ensemble)")
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
@@ -1238,7 +1232,7 @@ def cleanup_resources():
 # === Main Entry Point =====
 # ==========================
 if __name__ == '__main__':
-    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30) # ### MODIFIED ###
+    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30)
     hw_init_attempted = False
     try:
         initialize_hardware(); hw_init_attempted = True
