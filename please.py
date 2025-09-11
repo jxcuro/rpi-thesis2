@@ -148,12 +148,12 @@ MODEL_WEIGHTS = {
 #       per feature the model expects (e.g., [value1] for 1 feature).
 SCALER_PARAMS = {
     'magnetism': {
-        'mean': [0.0],  # Example: Mean of magnetism training data
-        'scale': [1.0]  # Example: Std Dev of magnetism training data
+        'mean': [-4.762684124386253e-05],  # Example: Mean of magnetism training data
+        'scale': [0.0009136177067612571]  # Example: Std Dev of magnetism training data
     },
     'resistivity': {
-        'mean': [24500.0], # Example: Mean of LDC RP training data
-        'scale': [500.0]   # Example: Std Dev of LDC RP training data
+        'mean': [61000.82880524], # Example: Mean of LDC RP training data
+        'scale': [1362.77165264]   # Example: Std Dev of LDC RP training data
     }
 }
 # =========================================
