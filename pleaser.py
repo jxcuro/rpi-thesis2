@@ -4,12 +4,6 @@
 #              - While GPIO 23 is LOW, it continuously auto-calibrates.
 #              - After classifying, it enters a PAUSED state, ignoring new triggers.
 #              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
-# Version: 3.0.27 - FIXED:      System classifying 0µT as Steel. Added a "no object" check
-#                  -           to detect and ignore false triggers when both magnetism and
-#                  -           resistivity sensors are at their idle values.
-# Version: 3.0.26 - MODIFIED: Implemented a magnetism noise gate. Readings below a small
-#                  -           threshold (3.5µT) are now treated as 0.0 to eliminate
-#                  -           idle sensor noise from both the display and AI logic.
 # Version: 3.0.25 - FIXED:      Removed continuous auto-calibration which could create a faulty
 #                  -           baseline. Calibration now only occurs on startup and when
 #                  -           the 'Classify Another' button is pressed.
@@ -49,6 +43,14 @@ except ImportError:
         print("ERROR: TensorFlow Lite Runtime is not installed.")
         print("Please install it (e.g., 'pip install tflite-runtime' or follow official Pi instructions)")
         exit()
+
+# ### REMOVED ### - Joblib is no longer needed
+# try:
+#     import joblib
+# except ImportError:
+#     print("ERROR: Joblib is not installed.")
+#     print("Please install it: pip install joblib")
+#     exit()
 
 # --- I2C/ADS1115 Imports (for Hall Sensor/Magnetism) ---
 I2C_ENABLED = False # Default to False, set True if libraries import successfully
@@ -112,10 +114,6 @@ GUI_UPDATE_INTERVAL_MS = 100
 CAMERA_UPDATE_INTERVAL_MS = 50
 LDC_DISPLAY_BUFFER_SIZE = 5
 
-# --- Sensor Thresholds ---
-MAGNETISM_NOISE_GATE_MT = 0.0035 # Corresponds to 3.5µT. Readings below this are treated as zero.
-LDC_NO_OBJECT_THRESHOLD = 50     # Raw LDC counts. If delta is below this, assume no object.
-
 CAMERA_INDEX = 0
 DISPLAY_IMG_WIDTH = 640
 DISPLAY_IMG_HEIGHT = 480
@@ -145,8 +143,8 @@ LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 # --- Hierarchical Weights (Must sum to 1.0) ---
 MODEL_WEIGHTS = {
     'visual': 0.0,
-    'magnetism': 1.0,
-    'resistivity': 0.0
+    'magnetism': 0.0,
+    'resistivity': 1.0
 }
 
 # --- Hardcoded Scaler Parameters ---
@@ -357,6 +355,7 @@ def initialize_hardware():
 # =========================
 # === AI Model Setup ======
 # =========================
+# ### MODIFIED ### - Function to initialize all three AI models
 def initialize_ai():
     global loaded_labels
     global interpreter_visual, input_details_visual, output_details_visual
@@ -518,6 +517,7 @@ def get_averaged_rp_data(num_samples=NUM_SAMPLES_PER_UPDATE):
 # ==========================
 # === AI Processing ========
 # ==========================
+# ### NEW ### - Preprocessing functions for each model type
 def preprocess_visual_input(image_pil, input_details):
     """Prepares image data for the visual model."""
     if not input_details: return None
@@ -554,6 +554,7 @@ def preprocess_numerical_input(value, model_type, input_details):
         print(f"ERROR: Numerical preprocessing for {model_type} failed: {e}")
         return None
 
+# ### NEW ### - Function to run inference on a single model
 def run_single_inference(interpreter, input_details, processed_input):
     """Runs inference on a single TFLite interpreter."""
     if interpreter is None or processed_input is None:
@@ -570,6 +571,7 @@ def run_single_inference(interpreter, input_details, processed_input):
         traceback.print_exc()
         return None
 
+# ### NEW ### - Postprocessing with hierarchical weighted average
 def postprocess_hierarchical_output(outputs):
     global loaded_labels, MODEL_WEIGHTS
     print("\n--- Postprocessing AI Outputs (Hierarchical) ---")
@@ -590,7 +592,7 @@ def postprocess_hierarchical_output(outputs):
     for model_type, raw_output in outputs.items():
         weight = MODEL_WEIGHTS.get(model_type, 0)
         if weight == 0:
-            # print(f"Info: Skipping '{model_type}' model (weight is zero).")
+            print(f"Warning: No weight found for model '{model_type}', skipping its output.")
             continue
         
         if raw_output is not None and raw_output.shape == (1, num_classes):
@@ -785,10 +787,11 @@ def clear_results_display():
     if rv_magnetism_label: rv_magnetism_label.config(text=default_text)
     if rv_ldc_label: rv_ldc_label.config(text=default_text)
 
+# ### MODIFIED ### - Main classification logic using the hierarchical model system
 def capture_and_classify():
-    global window, camera, IDLE_VOLTAGE, IDLE_RP_VALUE, g_accepting_triggers
+    global window, camera, IDLE_VOLTAGE, IDLE_RP_VALUE
     global rv_image_label, rv_prediction_label, rv_confidence_label, rv_magnetism_label, rv_ldc_label
-    global save_output_var
+    global save_output_var, g_accepting_triggers
     global interpreter_visual, interpreter_magnetism, interpreter_resistivity
 
     # --- Disarm the trigger as soon as we start processing ---
@@ -824,11 +827,6 @@ def capture_and_classify():
     avg_v_capture = get_averaged_hall_voltage(num_samples=NUM_SAMPLES_CALIBRATION)
     if avg_v_capture is not None and abs(SENSITIVITY_V_PER_MILLITESLA) > 1e-9:
         current_mag_mT = (avg_v_capture - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
-
-        # Apply Noise Gate
-        if current_mag_mT is not None and abs(current_mag_mT) < MAGNETISM_NOISE_GATE_MT:
-            print(f"Noise gate: Original reading {current_mag_mT*1000:+.2f}µT is below threshold, setting to 0.")
-            current_mag_mT = 0.0
     else:
         print("ERROR: Hall sensor read failed during capture.")
 
@@ -839,17 +837,6 @@ def capture_and_classify():
         current_rp_raw = avg_rp_val
     else:
         print("ERROR: LDC read failed during capture.")
-
-    # ### START MODIFICATION: False Trigger / No Object Detection ###
-    # If magnetism is zero AND the LDC reading is very close to its idle value,
-    # assume no object is present and it was a false trigger.
-    if current_rp_raw is not None and current_mag_mT is not None:
-        rp_delta = abs(current_rp_raw - IDLE_RP_VALUE)
-        if current_mag_mT == 0.0 and rp_delta < LDC_NO_OBJECT_THRESHOLD:
-            print(f"--- False trigger detected (Mag=0.0µT, LDC Δ={int(rp_delta)}). Re-arming system. ---")
-            g_accepting_triggers = True # Re-arm the system immediately
-            return # Exit without classifying or showing results
-    # ### END MODIFICATION ###
 
     # --- Preprocess Data for Each Model ---
     print("\n--- Preprocessing all inputs ---")
@@ -873,19 +860,22 @@ def capture_and_classify():
     
     print(f"\n--- HIERARCHICAL RESULT: Prediction='{predicted_label}', Confidence={confidence:.1%} ---")
 
-    # === Rule-based override for high magnetism ===
-    # If a significant magnetic field is detected, override any non-ferromagnetic
-    # classification to "Steel". This acts as a safety net.
-    MAGNETISM_OVERRIDE_THRESHOLD_MT = 0.004 # Corresponds to 4.0µT (must be > noise gate)
+    # === START MODIFICATION: Rule-based override for high magnetism ===
+    # If a significant magnetic field is detected (> 1.0µT or 0.001mT),
+    # override any non-ferromagnetic classification to "Steel".
+    # This acts as a safety net against model misclassifications for ferrous metals.
+    MAGNETISM_OVERRIDE_THRESHOLD_MT = 0.001 # Corresponds to 1.0µT
     if current_mag_mT is not None and abs(current_mag_mT) > MAGNETISM_OVERRIDE_THRESHOLD_MT:
         if predicted_label in ["Aluminum", "Copper", "Others"]:
             original_prediction = predicted_label
             predicted_label = "Steel"
             confidence = 0.999 # Set a high confidence to reflect the override
-            print(f"!!! MAGNETIC OVERRIDE: Strong magnetism ({current_mag_mT*1000:+.1f}µT) detected.")
+            print(f"!!! MAGNETIC OVERRIDE: Strong magnetism ({current_mag_mT:+.3f}mT) detected.")
             print(f"    Original AI prediction '{original_prediction}' overridden to '{predicted_label}'.")
+    # === END MODIFICATION ===
 
     # --- Handle Saving and Sorting ---
+    # ### CORRECTED SECTION ###
     mag_display_text = ""
     if current_mag_mT is not None:
         if abs(current_mag_mT) < 0.1:
@@ -987,10 +977,6 @@ def update_magnetism():
                 # Calculate magnetism directly from the averaged voltage
                 current_mT = (avg_v - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
                 
-                # Apply Noise Gate
-                if abs(current_mT) < MAGNETISM_NOISE_GATE_MT:
-                    current_mT = 0.0
-
                 g_last_live_magnetism_mT = current_mT
 
                 # Format the display text based on the magnitude
@@ -1027,8 +1013,8 @@ def update_ldc_reading():
                 cur_rp = int(round(statistics.mean(RP_DISPLAY_BUFFER)))
                 delta = cur_rp - IDLE_RP_VALUE
                 display_text = f"{cur_rp}"
-                if IDLE_RP_VALUE != 0: display_text += f" (Δ{delta:+,})"
-                else: display_text += " (NoCal)"
+                if IDLE_RP_VALUE != 0: display_text += f"(Δ{delta:+,})"
+                else: display_text += "(NoCal)"
             else: display_text = "Buffer..."
         else: display_text = "ReadErr"
     if lv_ldc_label and lv_ldc_label.cget("text") != display_text: lv_ldc_label.config(text=display_text)
@@ -1040,7 +1026,7 @@ def manage_automation_flow():
     - On LOW->HIGH transition: Triggers classification ONLY if the system is armed.
     - Continuous auto-calibration has been REMOVED to ensure a stable baseline.
     """
-    global window, g_previous_control_state, g_accepting_triggers
+    global window, g_previous_control_state, g_last_calibration_time, g_accepting_triggers
     global CONTROL_PIN, CONTROL_PIN_SETUP_OK, RPi_GPIO_AVAILABLE
 
     if not window or not window.winfo_exists(): return
@@ -1058,8 +1044,21 @@ def manage_automation_flow():
         # RISING EDGE (LOW -> HIGH): Trigger classification if system is armed
         if g_accepting_triggers and current_state == GPIO.HIGH and g_previous_control_state == GPIO.LOW:
             print(f"AUTOMATION: Armed and rising edge detected. Scheduling classification...")
-            window.after(100, capture_and_classify) # Shortened delay
+            window.after(2000, capture_and_classify) # 2s delay
         
+        # ### MODIFICATION ###
+        # The following block for auto-calibration when the state is LOW has been removed.
+        # This prevents the system from setting an incorrect idle baseline if an object
+        # is present on the sensor during the idle phase. Calibration is now only
+        # performed explicitly on startup and when "Classify Another" is clicked.
+        
+        # # STATE IS LOW: Perform periodic calibration (REMOVED)
+        # elif current_state == GPIO.LOW:
+        #     current_time = time.time()
+        #     if (current_time - g_last_calibration_time) >= 0.5:
+        #         calibrate_sensors(is_manual_call=False)
+        #         g_last_calibration_time = current_time
+
         g_previous_control_state = current_state
 
     except Exception as e:
@@ -1081,7 +1080,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.27 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
+    window.title("AI Metal Classifier v3.0.25 (RPi - Hierarchical Ensemble)") # ### MODIFIED ###
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
@@ -1111,7 +1110,7 @@ def setup_gui():
     lv_controls_frame = ttk.Frame(live_view_frame); lv_controls_frame.grid(row=0, column=1, sticky="nsew", padx=(5,0)); lv_controls_frame.columnconfigure(0, weight=1)
     lv_readings_frame = ttk.Labelframe(lv_controls_frame, text=" Live Readings ", padding="8 4 8 4"); lv_readings_frame.grid(row=0, column=0, sticky="new", pady=(0, 10)); lv_readings_frame.columnconfigure(1, weight=1)
     ttk.Label(lv_readings_frame, text="Magnetism:").grid(row=0, column=0, sticky="w", padx=(0, 8)); lv_magnetism_label = ttk.Label(lv_readings_frame, text="Init...", style="Readout.TLabel"); lv_magnetism_label.grid(row=0, column=1, sticky="ew")
-    ttk.Label(lv_readings_frame, text="LDC Reading:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(2,0)); lv_ldc_label = ttk.Label(lv_readings_frame, text="Init...", style="Readout.TLabel"); lv_ldc_label.grid(row=1, column=1, sticky="ew", pady=(2,0))
+    ttk.Label(lv_readings_frame, text="LDC (Delta):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(2,0)); lv_ldc_label = ttk.Label(lv_readings_frame, text="Init...", style="Readout.TLabel"); lv_ldc_label.grid(row=1, column=1, sticky="ew", pady=(2,0))
     
     lv_actions_frame = ttk.Labelframe(lv_controls_frame, text=" Status & Options ", padding="8 4 8 8")
     lv_actions_frame.grid(row=1, column=0, sticky="new", pady=(0,10)); lv_actions_frame.columnconfigure(0, weight=1)
@@ -1230,7 +1229,7 @@ def cleanup_resources():
 # === Main Entry Point =====
 # ==========================
 if __name__ == '__main__':
-    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30)
+    print("="*30 + "\n Starting AI Metal Classifier (RPi Hierarchical Ensemble) \n" + "="*30) # ### MODIFIED ###
     hw_init_attempted = False
     try:
         initialize_hardware(); hw_init_attempted = True
