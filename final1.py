@@ -148,9 +148,9 @@ MAGNETIC_WEIGHTS = {
 
 # Weights to use WHEN an object is NOT detected as magnetic
 NON_MAGNETIC_WEIGHTS = {
-    'visual': 0.6,     # Visual model is the primary classifier
-    'magnetism': 0.1,  # Ignore the magnetism model's opinion on non-magnetic types
-    'resistivity': 0.3 # Resistivity is a strong tie-breaker between visual similarities
+    'visual': 0.5,     # Visual model is the primary classifier
+    'magnetism': 0.0,  # Ignore the magnetism model's opinion on non-magnetic types
+    'resistivity': 0.5 # Resistivity is a strong tie-breaker between visual similarities
 }
 
 # --- Hardcoded Scaler Parameters ---
