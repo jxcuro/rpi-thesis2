@@ -895,7 +895,7 @@ def calibrate_sensors(is_manual_call=False):
     global IDLE_VOLTAGE, IDLE_RP_VALUE, g_last_live_magnetism_mT
     global hall_sensor, ldc_initialized
 
-    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 1.2:
+    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 2.0:
         return
 
     if is_manual_call:
@@ -1031,7 +1031,7 @@ def manage_automation_flow():
 
         elif current_state == GPIO.LOW:
             g_low_pulse_counter += 1
-            if g_low_pulse_counter >= 4:
+            if g_low_pulse_counter >= 5:
                 calibrate_sensors(is_manual_call=False)
                 g_low_pulse_counter = 0
 
