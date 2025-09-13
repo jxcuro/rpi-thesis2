@@ -137,7 +137,7 @@ MODEL_RESISTIVITY_PATH = os.path.join(BASE_PATH, MODEL_RESISTIVITY_FILENAME)
 LABELS_PATH = os.path.join(BASE_PATH, LABELS_FILENAME)
 
 # --- ### MODIFIED ### Dynamic Hierarchical Weights ---
-MAGNETISM_THRESHOLD_mT = 0.0025 # Defines the cutoff for what is considered "magnetic" (in milliTesla)
+MAGNETISM_THRESHOLD_mT = 0.0012 # Defines the cutoff for what is considered "magnetic" (in milliTesla)
 
 # Weights to use WHEN an object IS detected as magnetic
 MAGNETIC_WEIGHTS = {
@@ -1031,7 +1031,7 @@ def manage_automation_flow():
 
         elif current_state == GPIO.LOW:
             g_low_pulse_counter += 1
-            if g_low_pulse_counter >= 5:
+            if g_low_pulse_counter >= 4:
                 calibrate_sensors(is_manual_call=False)
                 g_low_pulse_counter = 0
 
