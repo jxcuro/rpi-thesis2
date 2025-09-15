@@ -141,9 +141,9 @@ MAGNETISM_THRESHOLD_mT = 0.0012 # Defines the cutoff for what is considered "mag
 
 # Weights to use WHEN an object IS detected as magnetic
 MAGNETIC_WEIGHTS = {
-    'visual': 0.25,
-    'magnetism': 0.60,  # Trust the magnetism model completely
-    'resistivity': 0.15
+    'visual': 0.40,
+    'magnetism': 0.35,  # Trust the magnetism model completely
+    'resistivity': 0.25
 }
 
 # Weights to use WHEN an object is NOT detected as magnetic
@@ -1031,7 +1031,7 @@ def manage_automation_flow():
 
         elif current_state == GPIO.LOW:
             g_low_pulse_counter += 1
-            if g_low_pulse_counter >= 10:
+            if g_low_pulse_counter >= 5:
                 calibrate_sensors(is_manual_call=False)
                 g_low_pulse_counter = 0
 
