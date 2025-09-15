@@ -1031,7 +1031,7 @@ def manage_automation_flow():
 
         elif current_state == GPIO.LOW:
             g_low_pulse_counter += 1
-            if g_low_pulse_counter >= 5:
+            if g_low_pulse_counter >= 10:
                 calibrate_sensors(is_manual_call=False)
                 g_low_pulse_counter = 0
 
