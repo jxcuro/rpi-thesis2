@@ -895,7 +895,7 @@ def calibrate_sensors(is_manual_call=False):
     global IDLE_VOLTAGE, IDLE_RP_VALUE, g_last_live_magnetism_mT
     global hall_sensor, ldc_initialized
 
-    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 2.0:
+    if not is_manual_call and abs(g_last_live_magnetism_mT * 1000) > 1.2:
         return
 
     if is_manual_call:
