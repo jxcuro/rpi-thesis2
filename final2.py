@@ -1,29 +1,16 @@
 # CODE 3.0.21 - AI Metal Classifier GUI with Gated Automation
-# Description: Displays live sensor data and camera feed.
-#              - On startup, waits for a LOW->HIGH signal on GPIO 23 to classify.
-#              - While GPIO 23 is LOW, it continuously auto-calibrates.
-#              - After classifying, it enters a PAUSED state, ignoring new triggers.
-#              - Clicking 'Classify Another' RE-ARMS the system for the next trigger.
+# ... (previous version history) ...
+# Version: 3.0.32 - IMPROVED: Implemented "Responsive Smoothing" for the magnetism
+#                  -           sensor. The smoothing buffer is now flushed on
+#                  -           large signal changes, providing both idle stability
+#                  -           against spikes and instant responsiveness for detection.
+#                  -           This fixes detection lag and prevents false auto-calibration.
 # Version: 3.0.31 - MODIFIED: Implemented sensor smoothing for stability while
 #                  -           REVERTING GUI and calibration logic to be fully
 #                  -           automated as per original design. Spikes are fixed
 #                  -           without changing the user-facing workflow.
-# Version: 3.0.30 - MODIFIED: Implemented sensor smoothing and improved calibration
-#                  -           logic inspired by magnetism-test.py to address sensor
-#                  -           instability and spikes.
-#                  -           1. Added a temporal smoothing buffer for magnetism.
-#                  -           2. Increased samples per reading for robustness.
-#                  -           3. Added a manual 'Calibrate' button to the GUI.
-#                  -           4. Made auto-calibration logic more resilient.
-# Version: 3.0.29 - IMPLEMENTED: Dynamic model weighting. The system now
-#                  -           chooses between two different sets of model weights
-#                  -           based on whether the raw magnetism reading is above a
-#                  -           threshold, better leveraging each sensor's strengths.
-# Version: 3.0.28 - FIXED: Magnetism reading instability by implementing "smart"
-#                  -           auto-calibration. The system now checks if a magnetic
-#                  -           field is present before recalibrating the idle voltage,
-#                  -           preventing the baseline from being incorrectly reset.
 
+# ... (imports are the same) ...
 import tkinter as tk
 from tkinter import ttk
 from tkinter import font as tkFont
@@ -108,15 +95,21 @@ CONTROL_CHECK_INTERVAL_MS = 50 # How often to check the control pin (in millisec
 # ==================================
 # === Constants and Configuration ===
 # ==================================
-### KEPT FOR STABILITY ### - More samples and faster updates for responsiveness
+### KEPT FOR STABILITY ###
 NUM_SAMPLES_PER_UPDATE = 7
-NUM_SAMPLES_CALIBRATION = 25 # Increased for a more stable baseline
-GUI_UPDATE_INTERVAL_MS = 60 # Faster update rate
+NUM_SAMPLES_CALIBRATION = 25
+GUI_UPDATE_INTERVAL_MS = 60
 CAMERA_UPDATE_INTERVAL_MS = 50
+MAGNETISM_SMOOTHING_BUFFER_SIZE = 10
 
-### KEPT FOR STABILITY ### - Buffer for smoothing live magnetism readings
-MAGNETISM_SMOOTHING_BUFFER_SIZE = 10 # Average over the last 10 readings for a stable display
+### NEW ### - Parameters for Responsive Smoothing (Tunable)
+# To trigger a flush, the new reading must be:
+# 1. Greater than this absolute threshold (to ignore noise)
+FLUSH_ABS_THRESHOLD_MT = 0.08 # in milliTesla (mT)
+# 2. This many times larger than the current smoothed average
+FLUSH_RATIO_THRESHOLD = 5.0
 
+# ... (The rest of the configuration section is unchanged) ...
 CAMERA_INDEX = 0
 DISPLAY_IMG_WIDTH = 640
 DISPLAY_IMG_HEIGHT = 480
@@ -217,7 +210,7 @@ input_details_resistivity = None
 output_details_resistivity = None
 loaded_labels = []
 
-### KEPT FOR STABILITY ### - Global buffer for magnetism smoothing
+### KEPT FOR STABILITY ###
 MAGNETISM_LIVE_BUFFER = deque(maxlen=MAGNETISM_SMOOTHING_BUFFER_SIZE)
 g_last_live_magnetism_mT = 0.0
 
@@ -233,10 +226,11 @@ placeholder_img_tk = None
 save_output_var = None
 
 # --- State for Gated GPIO Automation ---
-g_accepting_triggers = True     # Controls if the system will respond to a GPIO signal
-g_previous_control_state = None # Tracks GPIO 23 state to detect rising edges
-g_low_pulse_counter = 0         # Counts consecutive LOW reads for calibration trigger
+g_accepting_triggers = True
+g_previous_control_state = None
+g_low_pulse_counter = 0
 
+# ... (All functions from initialize_hardware to capture_and_classify are unchanged) ...
 # =========================
 # === Hardware Setup ===
 # =========================
@@ -656,7 +650,6 @@ def send_sorting_signal(material_label):
 # ==============================
 # === View Switching Logic ===
 # ==============================
-### REVERTED ### - Revert to original function call logic for automated calibration
 def calibrate_and_show_live_view():
     """Re-arms the trigger, runs a calibration, and shows the live view."""
     global g_accepting_triggers
@@ -895,7 +888,6 @@ def capture_and_classify():
     show_results_view()
     print("="*10 + " Capture & Classify Complete " + "="*10 + "\n")
 
-### REVERTED ### - Restored original "smart" auto-calibration logic from v3.0.28
 def calibrate_sensors(is_manual_call=False):
     global IDLE_VOLTAGE, IDLE_RP_VALUE, g_last_live_magnetism_mT
     global hall_sensor, ldc_initialized
@@ -950,7 +942,7 @@ def update_camera_feed():
                  lv_camera_label.configure(image='', text="Camera Failed"); lv_camera_label.img_tk = None
     if window and window.winfo_exists(): window.after(CAMERA_UPDATE_INTERVAL_MS, update_camera_feed)
 
-### KEPT FOR STABILITY ### - This is the core logic change using the smoothing buffer
+### MODIFIED ### - Implemented "Responsive Smoothing" logic
 def update_magnetism():
     global lv_magnetism_label, window, IDLE_VOLTAGE, hall_sensor
     global g_last_live_magnetism_mT, MAGNETISM_LIVE_BUFFER
@@ -959,7 +951,6 @@ def update_magnetism():
     display_text = "N/A"
     
     if hall_sensor:
-        # 1. Get a new, robust reading
         avg_v = get_averaged_hall_voltage(num_samples=NUM_SAMPLES_PER_UPDATE)
         
         if avg_v is not None:
@@ -967,20 +958,39 @@ def update_magnetism():
                 if abs(SENSITIVITY_V_PER_MILLITESLA) < 1e-9:
                     raise ZeroDivisionError("Sensitivity is zero")
                 
-                # 2. Calculate the instantaneous magnetism
+                # 1. Calculate the instantaneous magnetism
                 current_mT = (avg_v - IDLE_VOLTAGE) / SENSITIVITY_V_PER_MILLITESLA
                 
-                # 3. Add the new reading to our smoothing buffer
-                MAGNETISM_LIVE_BUFFER.append(current_mT)
-                
-                # 4. Calculate the smoothed value from the buffer for display
+                # 2. Get the current smoothed average
                 smoothed_mT = 0.0
-                if MAGNETISM_LIVE_BUFFER: # Ensure buffer is not empty
+                if MAGNETISM_LIVE_BUFFER:
                     smoothed_mT = statistics.mean(MAGNETISM_LIVE_BUFFER)
 
-                g_last_live_magnetism_mT = smoothed_mT # Update global state with smoothed value
+                # 3. ### NEW: Responsive Logic ###
+                # Check for a large, sudden change to flush the buffer
+                abs_current = abs(current_mT)
+                abs_smoothed = abs(smoothed_mT)
                 
-                # 5. Format the smoothed value for display
+                # Condition: Is the new value significant and much larger than the average?
+                if (abs_current > FLUSH_ABS_THRESHOLD_MT and 
+                    (abs_smoothed < 1e-9 or abs_current / abs_smoothed > FLUSH_RATIO_THRESHOLD)):
+                    
+                    # If so, flush the buffer by filling it with the new value
+                    print(f"--- Responsive Flush Triggered: {smoothed_mT:.3f} -> {current_mT:.3f} ---")
+                    for _ in range(MAGNETISM_SMOOTHING_BUFFER_SIZE):
+                        MAGNETISM_LIVE_BUFFER.append(current_mT)
+                    
+                    # The new smoothed value IS the current value
+                    smoothed_mT = current_mT
+                else:
+                    # If no large change, just do normal smoothing
+                    MAGNETISM_LIVE_BUFFER.append(current_mT)
+                    if MAGNETISM_LIVE_BUFFER:
+                        smoothed_mT = statistics.mean(MAGNETISM_LIVE_BUFFER)
+
+                # 4. Update global state and format for display
+                g_last_live_magnetism_mT = smoothed_mT
+                
                 if abs(smoothed_mT) < 1:
                     display_text = f"{smoothed_mT * 1000:+.1f}µT"
                 else:
@@ -1001,6 +1011,7 @@ def update_magnetism():
     if window and window.winfo_exists():
         window.after(GUI_UPDATE_INTERVAL_MS, update_magnetism)
 
+# ... (The rest of the file is unchanged) ...
 def update_ldc_reading():
     global lv_ldc_label, window, IDLE_RP_VALUE, ldc_initialized
     if not window or not window.winfo_exists(): return
@@ -1069,7 +1080,6 @@ def manage_automation_flow():
 # ======================
 # === GUI Setup ========
 # ======================
-### REVERTED ### - GUI is back to the original layout with no manual buttons
 def setup_gui():
     global window, main_frame, placeholder_img_tk, live_view_frame, results_view_frame
     global lv_camera_label, lv_magnetism_label, lv_ldc_label, lv_save_checkbox 
@@ -1079,7 +1089,7 @@ def setup_gui():
 
     print("Setting up GUI...")
     window = tk.Tk()
-    window.title("AI Metal Classifier v3.0.31 (RPi - Dynamic Ensemble)")
+    window.title("AI Metal Classifier v3.0.32 (RPi - Responsive Smoothing)")
     window.geometry("800x600")
     style = ttk.Style()
     available_themes = style.theme_names(); style.theme_use('clam' if 'clam' in available_themes else 'default')
